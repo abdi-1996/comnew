@@ -45,7 +45,7 @@ pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0.01
 
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
-PCREMOTE_VERSION = "6.2.2"
+PCREMOTE_VERSION = "6.3.0"
 CONFIG_PATH = APP_DIR / "config.json"
 ICON_CACHE_DIR = APP_DIR / "icon_cache"
 ICON_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -92,6 +92,9 @@ COMFY_STATE = {
     "current_node": None,
     "prompt_id": None,
     "error": None,
+    "stage": "idle",
+    "started_at": None,
+    "finished_at": None,
     "updated": 0.0,
 }
 COMFY_WS_THREAD = None
@@ -1055,7 +1058,13 @@ def _comfy_ws_loop():
                         remaining = int(remaining)
                     except Exception:
                         remaining = 0
-                    _set_comfy_state(connected=True, queue_remaining=remaining, error=None)
+                    snapshot = _comfy_state_copy()
+                    updates = {"connected": True, "queue_remaining": remaining, "error": None}
+                    if remaining > 0 and not snapshot.get("running"):
+                        updates["stage"] = "queued"
+                    elif remaining == 0 and not snapshot.get("running") and snapshot.get("stage") == "queued":
+                        updates["stage"] = "idle"
+                    _set_comfy_state(**updates)
                 elif event_type == "execution_start":
                     _set_comfy_state(
                         connected=True,
@@ -1064,6 +1073,9 @@ def _comfy_ws_loop():
                         prompt_id=data.get("prompt_id"),
                         current_node=None,
                         error=None,
+                        stage="starting",
+                        started_at=time.time(),
+                        finished_at=None,
                     )
                 elif event_type == "progress":
                     value = float(data.get("value", 0) or 0)
@@ -1076,6 +1088,7 @@ def _comfy_ws_loop():
                         prompt_id=data.get("prompt_id") or _comfy_state_copy().get("prompt_id"),
                         current_node=str(data.get("node")) if data.get("node") is not None else None,
                         error=None,
+                        stage="sampling",
                     )
                 elif event_type == "executing":
                     node = data.get("node")
@@ -1088,6 +1101,8 @@ def _comfy_ws_loop():
                             prompt_id=prompt_id,
                             current_node=None,
                             error=None,
+                            stage="complete",
+                            finished_at=time.time(),
                         )
                     else:
                         _set_comfy_state(
@@ -1096,6 +1111,7 @@ def _comfy_ws_loop():
                             prompt_id=prompt_id,
                             current_node=str(node),
                             error=None,
+                            stage="executing",
                         )
                 elif event_type == "execution_error":
                     _set_comfy_state(
@@ -1103,6 +1119,8 @@ def _comfy_ws_loop():
                         running=False,
                         prompt_id=data.get("prompt_id"),
                         error=str(data.get("exception_message") or data.get("exception_type") or "Ошибка ComfyUI"),
+                        stage="error",
+                        finished_at=time.time(),
                     )
                 elif event_type == "execution_interrupted":
                     _set_comfy_state(
@@ -1110,6 +1128,8 @@ def _comfy_ws_loop():
                         running=False,
                         prompt_id=data.get("prompt_id"),
                         error="Генерация остановлена",
+                        stage="stopped",
+                        finished_at=time.time(),
                     )
         except Exception:
             _set_comfy_state(connected=False, running=False, current_node=None)
@@ -3136,6 +3156,7 @@ def comfy_dashboard():
             "message": "ComfyUI не отвечает на 127.0.0.1:8188.",
             "running": False, "progress": 0.0, "queue_remaining": 0,
             "current_node": None, "prompt_id": None, "error": None,
+            "stage": "offline", "started_at": None, "finished_at": None,
             "workflows": [], "selected_workflow": None,
             "parameters": _extract_workflow_parameters({}),
             "checkpoints": [], "loras": [], "vaes": [], "samplers": [], "schedulers": [],
@@ -3185,6 +3206,9 @@ def comfy_dashboard():
         "current_node": state.get("current_node"),
         "prompt_id": state.get("prompt_id"),
         "error": state.get("error"),
+        "stage": state.get("stage") or ("executing" if state.get("running") else ("queued" if state.get("queue_remaining") else "idle")),
+        "started_at": state.get("started_at"),
+        "finished_at": state.get("finished_at"),
         "workflows": catalog,
         "selected_workflow": selected_id,
         "parameters": parameters,
@@ -3439,7 +3463,7 @@ def comfy_generate():
         prompt_id = str(response.get("prompt_id", "")) if isinstance(response, dict) else ""
         if not prompt_id:
             raise RuntimeError("ComfyUI не вернул prompt_id")
-        _set_comfy_state(connected=True, running=True, progress=0.0, prompt_id=prompt_id, current_node=None, error=None)
+        _set_comfy_state(connected=True, running=True, progress=0.0, prompt_id=prompt_id, current_node=None, error=None, stage="queued", started_at=time.time(), finished_at=None)
         _remember_generation(prompt_id, selected_id, params)
         return jsonify({"ok": True, "prompt_id": prompt_id, "error": None, "workflow_id": selected_id})
     except urllib.error.HTTPError as exc:
@@ -3456,7 +3480,7 @@ def comfy_generate():
 def comfy_interrupt():
     try:
         _comfy_json("/interrupt", method="POST", payload={}, timeout=5)
-        _set_comfy_state(running=False, error="Генерация остановлена")
+        _set_comfy_state(running=False, error="Генерация остановлена", stage="stopped", finished_at=time.time())
         return jsonify({"ok": True, "error": None})
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 502
@@ -3564,7 +3588,7 @@ def _aitk_token():
 
 
 def _aitk_headers(accept="application/json"):
-    headers = {"Accept": accept, "Accept-Encoding": "identity", "User-Agent": "PCRemoteServer/6.2"}
+    headers = {"Accept": accept, "Accept-Encoding": "identity", "User-Agent": "PCRemoteServer/6.3"}
     token = _aitk_token()
     if token:
         headers["Authorization"] = "Bearer " + token

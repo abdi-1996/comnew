@@ -497,6 +497,9 @@ struct ComfyDashboardResponse: Codable {
     let system: ComfySystemStats?
     let model_profile: String?
     let media_type: String?
+    let stage: String?
+    let started_at: Double?
+    let finished_at: Double?
 
     var queueRemaining: Int { queue_remaining }
     var currentNode: String? { current_node }
@@ -504,6 +507,9 @@ struct ComfyDashboardResponse: Codable {
     var selectedWorkflow: String? { selected_workflow }
     var modelProfile: String { model_profile ?? "generic" }
     var mediaType: String { media_type ?? "image" }
+    var generationStage: String { stage ?? (running ? "executing" : (queue_remaining > 0 ? "queued" : "idle")) }
+    var startedAt: Double? { started_at }
+    var finishedAt: Double? { finished_at }
 }
 
 struct ComfyGenerateResponse: Codable {

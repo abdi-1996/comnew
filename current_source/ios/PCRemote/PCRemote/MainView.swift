@@ -1904,6 +1904,59 @@ final class ComfyUIModel: ObservableObject {
         return "\(base) (#\(node.id))"
     }
 
+    private func outputSelectionKey(for workflowID: String) -> String {
+        "comfy.output.selection.\(device.storageKey).\(workflowID)"
+    }
+
+    private func outputOnlyKey(for workflowID: String) -> String {
+        "comfy.output.only.\(device.storageKey).\(workflowID)"
+    }
+
+    func selectOutputNode(_ nodeID: String) {
+        selectedOutputNodeID = nodeID
+        guard !selectedWorkflowID.isEmpty else { return }
+        UserDefaults.standard.set(nodeID, forKey: outputSelectionKey(for: selectedWorkflowID))
+    }
+
+    func setGenerateOnlySelectedOutput(_ enabled: Bool) {
+        generateOnlySelectedOutput = enabled
+        guard !selectedWorkflowID.isEmpty else { return }
+        UserDefaults.standard.set(enabled, forKey: outputOnlyKey(for: selectedWorkflowID))
+    }
+
+    var currentNodeDisplayName: String {
+        guard let nodeID = dashboard?.currentNode, !nodeID.isEmpty else { return "" }
+        if let node = workflowDetails?.nodes.first(where: { $0.id == nodeID }) {
+            let title = node.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            return title.isEmpty ? "\(node.classType) #\(nodeID)" : "\(title) #\(nodeID)"
+        }
+        return "Node #\(nodeID)"
+    }
+
+    var generationStageTitle: String {
+        if !available { return "Offline" }
+        switch dashboard?.generationStage ?? (running ? "executing" : "idle") {
+        case "queued": return "Queued"
+        case "starting": return "Starting…"
+        case "sampling": return "Sampling…"
+        case "executing": return "Executing…"
+        case "saving": return "Saving…"
+        case "complete": return "Complete"
+        case "stopped": return "Stopped"
+        case "error": return "Error"
+        case "offline": return "Offline"
+        default: return (dashboard?.queueRemaining ?? 0) > 0 ? "Queued" : "Ready"
+        }
+    }
+
+    var generationElapsedText: String {
+        guard let started = dashboard?.startedAt, started > 0 else { return "" }
+        let end = dashboard?.finishedAt ?? Date().timeIntervalSince1970
+        let total = max(0, Int(end - started))
+        if total >= 3600 { return String(format: "%d:%02d:%02d", total / 3600, (total / 60) % 60, total % 60) }
+        return String(format: "%d:%02d", total / 60, total % 60)
+    }
+
     func start() {
         guard pollTask == nil else { return }
         let needsInitialParameters = dashboard == nil
@@ -1972,8 +2025,14 @@ final class ComfyUIModel: ObservableObject {
             workflowDetails = details
             resolveMainPromptBindings(in: details)
             if !outputNodes.isEmpty {
-                if selectedOutputNodeID.isEmpty || !outputNodes.contains(where: { $0.id == selectedOutputNodeID }) {
+                let savedOutput = UserDefaults.standard.string(forKey: outputSelectionKey(for: selectedWorkflowID)) ?? ""
+                if !savedOutput.isEmpty, outputNodes.contains(where: { $0.id == savedOutput }) {
+                    selectedOutputNodeID = savedOutput
+                } else if selectedOutputNodeID.isEmpty || !outputNodes.contains(where: { $0.id == selectedOutputNodeID }) {
                     selectedOutputNodeID = outputNodes.first?.id ?? ""
+                }
+                if UserDefaults.standard.object(forKey: outputOnlyKey(for: selectedWorkflowID)) != nil {
+                    generateOnlySelectedOutput = UserDefaults.standard.bool(forKey: outputOnlyKey(for: selectedWorkflowID))
                 }
             } else {
                 selectedOutputNodeID = ""
@@ -1991,8 +2050,13 @@ final class ComfyUIModel: ObservableObject {
     private func isPromptTextInput(_ input: ComfyNodeInput) -> Bool {
         guard !input.isConnection else { return false }
         let name = input.name.lowercased()
-        let known = Set(["text", "prompt", "positive", "negative", "caption", "text_g", "text_l", "positive_prompt", "negative_prompt"])
-        return known.contains(name) && (input.valueType == "string" || input.valueType == "json")
+        let known = Set([
+            "text", "prompt", "positive", "negative", "caption", "description", "instruction",
+            "text_g", "text_l", "prompt_text", "text_prompt", "positive_prompt", "negative_prompt",
+            "positive_text", "negative_text", "text_positive", "text_negative"
+        ])
+        let looksTextual = input.valueType == "string" || input.valueType == "json" || input.inputType.uppercased() == "STRING"
+        return known.contains(name) && looksTextual
     }
 
     private func isPromptTextNode(_ node: ComfyNodeInfo) -> Bool {
@@ -2301,6 +2365,7 @@ private struct ComfyInputTarget: Identifiable {
 
 struct ComfyUIView: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
     @ObservedObject var model: ComfyUIModel
     @State private var showWorkflowPicker = false
     @State private var selectedImage: ComfyImageItem?
@@ -2411,6 +2476,10 @@ struct ComfyUIView: View {
         .preferredColorScheme(.dark)
         .toolbar {
             ToolbarItemGroup(placement: .keyboard) {
+                Button("Готово") {
+                    promptEditorFocused = false
+                    hideKeyboard()
+                }
                 Spacer()
                 Button("🎲 Generate") {
                     promptEditorFocused = false
@@ -2511,6 +2580,17 @@ struct ComfyUIView: View {
             Text("Результат исчезнет из галереи. Если файл найден в папке ComfyUI output, он также будет удалён с ПК.")
         }
         .onAppear { model.start() }
+        .onChange(of: scenePhase) { phase in
+            switch phase {
+            case .active:
+                model.start()
+                Task { await model.refresh(loadParameters: false) }
+            case .background:
+                model.stop()
+            default:
+                break
+            }
+        }
         .onDisappear { model.stop() }
     }
 
@@ -2762,7 +2842,7 @@ struct ComfyUIView: View {
 
                 Toggle(isOn: Binding(
                     get: { model.generateOnlySelectedOutput },
-                    set: { model.generateOnlySelectedOutput = $0 }
+                    set: { model.setGenerateOnlySelectedOutput($0) }
                 )) {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("Generate only selected output")
@@ -2778,7 +2858,7 @@ struct ComfyUIView: View {
                 if model.generateOnlySelectedOutput {
                     VStack(spacing: 8) {
                         ForEach(model.outputNodes) { node in
-                            Button { model.selectedOutputNodeID = node.id } label: {
+                            Button { model.selectOutputNode(node.id) } label: {
                                 HStack(spacing: 10) {
                                     ZStack {
                                         Circle()
@@ -2957,27 +3037,23 @@ struct ComfyUIView: View {
                 VStack(spacing: 12) {
                     HStack {
                         VStack(alignment: .leading, spacing: 4) {
-                            if model.running {
-                                Text("Generating…")
-                                    .font(.system(size: 16, weight: .bold))
-                            } else {
-                                Button { model.randomizeSeed() } label: {
-                                    HStack(spacing: 6) {
-                                        Image(systemName: "dice.fill")
-                                        Text("Random Seed Generated")
-                                    }
-                                    .font(.system(size: 16, weight: .bold))
-                                }
-                                .buttonStyle(.plain)
-                            }
+                            Text(model.generationStageTitle)
+                                .font(.system(size: 16, weight: .bold))
                             Text(queueSubtitle)
                                 .font(.system(size: 11, weight: .medium))
                                 .foregroundStyle(.white.opacity(0.54))
                         }
                         Spacer()
-                        Text(model.running ? "\(Int((model.dashboard?.progress ?? 0) * 100))%" : "Idle")
-                            .font(.system(size: 14, weight: .bold, design: .rounded))
-                            .foregroundStyle(model.running ? Color.cyan : Color.green)
+                        VStack(alignment: .trailing, spacing: 3) {
+                            Text(model.running ? "\(Int((model.dashboard?.progress ?? 0) * 100))%" : (model.dashboard?.generationStage == "complete" ? "100%" : "Idle"))
+                                .font(.system(size: 14, weight: .bold, design: .rounded))
+                                .foregroundStyle(model.running ? Color.cyan : Color.green)
+                            if !model.generationElapsedText.isEmpty {
+                                Label(model.generationElapsedText, systemImage: "timer")
+                                    .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                                    .foregroundStyle(.white.opacity(0.48))
+                            }
+                        }
                     }
 
                     GeometryReader { proxy in
@@ -2997,9 +3073,12 @@ struct ComfyUIView: View {
 
     private var queueSubtitle: String {
         let remaining = model.dashboard?.queueRemaining ?? 0
-        if let node = model.dashboard?.currentNode, model.running {
-            return "Node \(node) • Queue: \(remaining)"
+        if model.running, !model.currentNodeDisplayName.isEmpty {
+            return "\(model.currentNodeDisplayName) • Queue: \(remaining)"
         }
+        if model.dashboard?.generationStage == "complete" { return "Результат сохранён • Queue: \(remaining)" }
+        if model.dashboard?.generationStage == "stopped" { return "Генерация остановлена • Queue: \(remaining)" }
+        if model.dashboard?.generationStage == "error", let message = model.dashboard?.error, !message.isEmpty { return message }
         return remaining > 0 ? "В очереди: \(remaining)" : "Очередь пуста"
     }
 
