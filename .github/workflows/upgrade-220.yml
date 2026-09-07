@@ -1,0 +1,48 @@
+name: Apply Comfy Remote 2.2.0 Source Update
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/upgrade-220.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply 2.2.0 upgrade
+        run: python3 tools/apply_220.py
+
+      - name: Validate upgraded source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile current_source/windows/server.py current_source/windows/gui.py
+          grep -q 'PCREMOTE_VERSION = "6.3.0"' current_source/windows/server.py
+          grep -q 'let stage: String?' current_source/ios/PCRemote/PCRemote/Models.swift
+          grep -q 'generationStageTitle' current_source/ios/PCRemote/PCRemote/MainView.swift
+          grep -q 'scenePhase' current_source/ios/PCRemote/PCRemote/MainView.swift
+          grep -q '2.2.0' current_source/ios/PCRemote/PCRemote/Info.plist
+
+      - name: Commit upgraded source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Comfy Remote Builder"
+          git config user.email "actions@users.noreply.github.com"
+          git add current_source
+          if git diff --cached --quiet; then
+            echo "2.2.0 source already applied"
+            exit 0
+          fi
+          git commit -m "Update Comfy Remote to 2.2.0 and server to 6.3.0"
+          git push origin HEAD:main
