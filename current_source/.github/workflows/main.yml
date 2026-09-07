@@ -1,0 +1,290 @@
+name: Build Comfy Remote
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ios:
+    name: Build Comfy Remote IPA
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Find Xcode project
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROJECT_PATH="$(find "$GITHUB_WORKSPACE" -type d -name 'PCRemote.xcodeproj' -print -quit)"
+          if [ -z "$PROJECT_PATH" ]; then
+            echo "ERROR: PCRemote.xcodeproj not found"
+            exit 1
+          fi
+          echo "Using $PROJECT_PATH"
+          echo "path=$PROJECT_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Download pinned llama.cpp iOS XCFramework
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PROJECT_DIR="$(dirname "${{ steps.project.outputs.path }}")"
+          VENDOR_DIR="$PROJECT_DIR/Vendor"
+          TMP_DIR="$RUNNER_TEMP/llama-xcframework"
+          rm -rf "$TMP_DIR" "$VENDOR_DIR/llama.xcframework"
+          mkdir -p "$TMP_DIR" "$VENDOR_DIR"
+          export TMP_DIR
+          python3 - <<'PYDOWNLOAD'
+          import json, os, urllib.request
+          tag = "b10453"
+          api = f"https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/{tag}"
+          headers = {"Accept": "application/vnd.github+json", "User-Agent": "ComfyRemote-Build"}
+          token = os.environ.get("GH_TOKEN")
+          if token:
+              headers["Authorization"] = f"Bearer {token}"
+          req = urllib.request.Request(api, headers=headers)
+          with urllib.request.urlopen(req, timeout=60) as response:
+              release = json.load(response)
+          assets = [a for a in release.get("assets", []) if "xcframework" in a.get("name", "").lower() and a.get("name", "").lower().endswith(".zip")]
+          if not assets:
+              raise SystemExit("No iOS XCFramework asset found in llama.cpp release " + tag)
+          asset = assets[0]
+          out = os.path.join(os.environ["TMP_DIR"], asset["name"])
+          print("Downloading", asset["name"])
+          download_req = urllib.request.Request(asset["browser_download_url"], headers={"User-Agent": "ComfyRemote-Build"})
+          with urllib.request.urlopen(download_req, timeout=180) as src, open(out, "wb") as dst:
+              while True:
+                  chunk = src.read(1024 * 1024)
+                  if not chunk:
+                      break
+                  dst.write(chunk)
+          print(out)
+          PYDOWNLOAD
+          ZIP_PATH="$(find "$TMP_DIR" -maxdepth 1 -type f -name '*xcframework*.zip' -print -quit)"
+          test -n "$ZIP_PATH"
+          unzip -q "$ZIP_PATH" -d "$TMP_DIR/unpacked"
+          XC_PATH="$(find "$TMP_DIR/unpacked" -type d -name 'llama.xcframework' -print -quit)"
+          test -n "$XC_PATH"
+          cp -R "$XC_PATH" "$VENDOR_DIR/llama.xcframework"
+          test -f "$VENDOR_DIR/llama.xcframework/Info.plist"
+          echo "llama.cpp XCFramework ready: $VENDOR_DIR/llama.xcframework"
+
+      - name: Verify Network.framework transport
+        shell: bash
+        run: |
+          set -euo pipefail
+          API_FILE="$(find "$GITHUB_WORKSPACE" -type f -path '*/PCRemote/APIClient.swift' -print -quit)"
+          test -n "$API_FILE"
+          grep -q 'import Network' "$API_FILE"
+          grep -q 'NWConnection' "$API_FILE"
+          grep -q 'RawHTTPClient.send' "$API_FILE"
+          if grep -E 'URLSession\.shared\.(data|download|upload)' "$API_FILE"; then
+            echo "ERROR: PC Remote API must not use URLSession for private HTTP transport"
+            exit 1
+          fi
+          echo "Network.framework transport verified"
+
+      - name: Build iPhone app
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project "${{ steps.project.outputs.path }}" \
+            -scheme PCRemote \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath "$GITHUB_WORKSPACE/ios-build" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            clean build
+
+      - name: Find built app
+        id: app
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_PATH="$(find "$GITHUB_WORKSPACE/ios-build/Build/Products/Release-iphoneos" -type d -name 'PCRemote.app' -print -quit)"
+          if [ -z "$APP_PATH" ]; then
+            echo "ERROR: PCRemote.app not found"
+            exit 1
+          fi
+          echo "path=$APP_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Verify embedded llama framework
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="${{ steps.app.outputs.path }}"
+          test -d "$APP/Frameworks/llama.framework"
+          test -f "$APP/Frameworks/llama.framework/llama"
+          APP_BIN="$APP/PCRemote"
+          test -f "$APP_BIN"
+          otool -L "$APP_BIN" | grep -q '@rpath/llama.framework/llama'
+          echo "Embedded llama.framework verified"
+
+      - name: Apply ATS fallback
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PLIST="${{ steps.app.outputs.path }}/Info.plist"
+          python3 - <<'PY'
+          import os, plistlib
+          path = os.environ['PLIST']
+          with open(path, 'rb') as f:
+              info = plistlib.load(f)
+          # PC Remote uses Network.framework for the actual private HTTP transport.
+          # These keys are only an additional compatibility fallback.
+          info['NSAppTransportSecurity'] = {
+              'NSAllowsArbitraryLoads': True,
+              'NSAllowsLocalNetworking': True,
+          }
+          info.setdefault(
+              'NSLocalNetworkUsageDescription',
+              'Comfy Remote uses LAN, ZeroTier and Tailscale to connect to your ComfyUI computer.'
+          )
+          with open(path, 'wb') as f:
+              plistlib.dump(info, f, fmt=plistlib.FMT_BINARY)
+          print('Version:', info.get('CFBundleShortVersionString'))
+          print('Build:', info.get('CFBundleVersion'))
+          PY
+
+      - name: Verify built Info.plist
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PLIST="${{ steps.app.outputs.path }}/Info.plist"
+          python3 - <<'PY'
+          import os, plistlib
+          with open(os.environ['PLIST'], 'rb') as f:
+              info = plistlib.load(f)
+          ats = info.get('NSAppTransportSecurity', {})
+          assert ats.get('NSAllowsArbitraryLoads') is True
+          assert ats.get('NSAllowsLocalNetworking') is True
+          print('Built Info.plist verified')
+          PY
+
+      - name: Create IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          rm -rf Payload ComfyRemote.ipa
+          mkdir -p Payload
+          cp -R "${{ steps.app.outputs.path }}" Payload/PCRemote.app
+          /usr/bin/zip -qry ComfyRemote.ipa Payload
+          test -s ComfyRemote.ipa
+          ls -lh ComfyRemote.ipa
+
+      - name: Verify packaged IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf ipa-check
+          mkdir ipa-check
+          unzip -q ComfyRemote.ipa -d ipa-check
+          test -f ipa-check/Payload/PCRemote.app/Info.plist
+          if find ipa-check/Payload/PCRemote.app -type f -name '*.gguf' | grep -q .; then
+            echo "ERROR: GGUF model must be downloaded on-device, not bundled in IPA"
+            exit 1
+          fi
+          test -f ipa-check/Payload/PCRemote.app/Frameworks/llama.framework/llama
+          echo "IPA package verified; llama.framework embedded and no GGUF model bundled"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ComfyRemote-IPA
+          path: ComfyRemote.ipa
+          if-no-files-found: error
+  windows:
+    name: Build Optimized PC Server
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Find Windows server
+        id: server
+        shell: pwsh
+        run: |
+          $gui = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -File -Filter gui.py |
+            Where-Object { $_.FullName -match '[\\/]windows[\\/]gui\.py$' } |
+            Select-Object -First 1
+          if (-not $gui) { throw "windows/gui.py not found" }
+          Write-Host "Using $($gui.FullName)"
+          "gui=$($gui.FullName)" >> $env:GITHUB_OUTPUT
+          "dir=$($gui.Directory.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Validate Python sources
+        shell: pwsh
+        run: |
+          python -m py_compile `
+            "${{ steps.server.outputs.dir }}\server.py" `
+            "${{ steps.server.outputs.dir }}\gui.py" `
+            "${{ steps.server.outputs.dir }}\corel_bridge.py"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip pyinstaller
+          $requirements = "${{ steps.server.outputs.dir }}\requirements.txt"
+          if (Test-Path $requirements) {
+            python -m pip install -r $requirements
+          }
+
+      - name: Build PC Remote Server
+        shell: pwsh
+        run: |
+          pyinstaller `
+            --noconfirm `
+            --clean `
+            --onefile `
+            --windowed `
+            --paths "${{ steps.server.outputs.dir }}" `
+            --collect-all mss `
+            --collect-all pyautogui `
+            --collect-all comtypes `
+            --hidden-import comtypes.client `
+            --hidden-import corel_bridge `
+            --hidden-import pyperclip `
+            --hidden-import psutil `
+            --hidden-import websocket `
+            --hidden-import winreg `
+            --name PCRemoteServer `
+            "${{ steps.server.outputs.gui }}"
+
+      - name: Prepare Windows package
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist\PCRemoteServer.exe")) {
+            throw "PCRemoteServer.exe was not created"
+          }
+          New-Item -ItemType Directory -Force -Path "PCRemote-Windows" | Out-Null
+          Copy-Item "dist\PCRemoteServer.exe" "PCRemote-Windows\PCRemoteServer.exe"
+          foreach ($name in @("SETUP_NETWORK_ADMIN.ps1", "SETUP_NETWORK_ADMIN.bat", "CHECK_NETWORK.ps1")) {
+            $source = Join-Path "${{ steps.server.outputs.dir }}" $name
+            if (Test-Path $source) { Copy-Item $source (Join-Path "PCRemote-Windows" $name) }
+          }
+          Get-ChildItem "PCRemote-Windows" | Format-Table Name,Length
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: PCRemoteServer-ComfyOptimized
+          path: PCRemote-Windows
+          if-no-files-found: error
+
