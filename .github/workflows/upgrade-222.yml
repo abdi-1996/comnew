@@ -15,8 +15,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Normalize legacy Xcode build settings
+        shell: bash
+        run: |
+          set -euo pipefail
+          PBX='current_source/ios/PCRemote/PCRemote.xcodeproj/project.pbxproj'
+          sed -i 's/MARKETING_VERSION = 2.1.3;/MARKETING_VERSION = 2.2.1;/g' "$PBX"
+          sed -i 's/CURRENT_PROJECT_VERSION = 16;/CURRENT_PROJECT_VERSION = 18;/g' "$PBX"
       - name: Apply 2.2.2 upgrade
         run: python3 tools/upgrade_222.py
+      - name: Update Info.plist version
+        shell: bash
+        run: |
+          set -euo pipefail
+          PLIST='current_source/ios/PCRemote/PCRemote/Info.plist'
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('current_source/ios/PCRemote/PCRemote/Info.plist')
+          s=p.read_text(encoding='utf-8')
+          s=s.replace('<key>CFBundleShortVersionString</key>\n\t<string>2.2.1</string>', '<key>CFBundleShortVersionString</key>\n\t<string>2.2.2</string>', 1)
+          s=s.replace('<key>CFBundleVersion</key>\n\t<string>18</string>', '<key>CFBundleVersion</key>\n\t<string>19</string>', 1)
+          p.write_text(s, encoding='utf-8')
+          PY
       - name: Validate upgraded source
         shell: bash
         run: |
@@ -29,6 +49,8 @@ jobs:
           grep -q 'promptSyncTask?.cancel()' current_source/ios/PCRemote/PCRemote/MainView.swift
           grep -q 'MARKETING_VERSION = 2.2.2;' current_source/ios/PCRemote/PCRemote.xcodeproj/project.pbxproj
           grep -q 'CURRENT_PROJECT_VERSION = 19;' current_source/ios/PCRemote/PCRemote.xcodeproj/project.pbxproj
+          grep -q '<string>2.2.2</string>' current_source/ios/PCRemote/PCRemote/Info.plist
+          grep -q '<string>19</string>' current_source/ios/PCRemote/PCRemote/Info.plist
           python3 -m py_compile current_source/windows/server.py current_source/windows/gui.py
       - name: Commit upgraded source
         shell: bash
