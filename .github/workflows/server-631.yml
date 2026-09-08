@@ -1,0 +1,98 @@
+name: Build PCRemoteServer 6.3.1 Stable
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/server-631.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Build and test PCRemoteServer 6.3.1
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify source
+        id: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $dir=Join-Path $env:GITHUB_WORKSPACE 'current_source\windows'
+          $gui=Join-Path $dir 'gui.py'
+          python -m py_compile (Join-Path $dir 'server.py') $gui (Join-Path $dir 'corel_bridge.py')
+          if (-not (Select-String -Path (Join-Path $dir 'server.py') -Pattern 'PCREMOTE_VERSION = "6.3.1"' -Quiet)) { throw '6.3.1 marker missing' }
+          "dir=$dir" >> $env:GITHUB_OUTPUT
+          "gui=$gui" >> $env:GITHUB_OUTPUT
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip pyinstaller
+          $req="${{ steps.source.outputs.dir }}\requirements.txt"
+          if (Test-Path $req) { python -m pip install -r $req }
+
+      - name: Build EXE
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed `
+            --paths "${{ steps.source.outputs.dir }}" `
+            --collect-all mss --collect-all pyautogui --collect-all comtypes `
+            --hidden-import comtypes.client --hidden-import corel_bridge `
+            --hidden-import pyperclip --hidden-import psutil --hidden-import websocket --hidden-import winreg `
+            --name PCRemoteServer "${{ steps.source.outputs.gui }}"
+
+      - name: Smoke test from stable install path
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          Get-Process PCRemoteServer -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          $sourceExe=Resolve-Path 'dist\PCRemoteServer.exe'
+          $stableDir=Join-Path $env:LOCALAPPDATA 'PCRemoteServer'
+          New-Item -ItemType Directory -Force -Path $stableDir | Out-Null
+          $stableExe=Join-Path $stableDir 'PCRemoteServer.exe'
+          Copy-Item $sourceExe $stableExe -Force
+          $proc=Start-Process -FilePath $stableExe -WorkingDirectory $stableDir -PassThru
+          try {
+            $ok=$false
+            for ($i=0; $i -lt 40; $i++) {
+              Start-Sleep -Milliseconds 750
+              try {
+                $r=Invoke-RestMethod -Uri 'http://127.0.0.1:8765/api/ping' -TimeoutSec 2
+                if ($r.ok -eq $true -and $r.server_version -eq '6.3.1') {
+                  Write-Host "Server smoke test OK: $($r.server_version)"
+                  $ok=$true
+                  break
+                }
+              } catch { Write-Host "Waiting for server" }
+              if ($proc.HasExited) { throw "Server exited with code $($proc.ExitCode)" }
+            }
+            if (-not $ok) { throw 'PCRemoteServer.exe did not answer /api/ping as 6.3.1' }
+          } finally {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            Get-Process PCRemoteServer -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path 'PCRemote-Windows' | Out-Null
+          Copy-Item 'dist\PCRemoteServer.exe' 'PCRemote-Windows\PCRemoteServer.exe'
+          foreach ($name in @('SETUP_NETWORK_ADMIN.ps1','SETUP_NETWORK_ADMIN.bat','CHECK_NETWORK.ps1','INSTALL_STABLE_SERVER.ps1','INSTALL_STABLE_SERVER.bat')) {
+            $src=Join-Path "${{ steps.source.outputs.dir }}" $name
+            if (Test-Path $src) { Copy-Item $src (Join-Path 'PCRemote-Windows' $name) }
+          }
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: PCRemoteServer-6.3.1-Stable
+          path: PCRemote-Windows
+          if-no-files-found: error
