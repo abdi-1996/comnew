@@ -1,0 +1,36 @@
+name: Patch Comfy Remote 2.2.2 Graph Prompt Detection
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/patch-222-graph.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply graph-aware prompt patch
+        run: python3 tools/patch_222_graph_prompt.py
+      - name: Validate server
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'downstream_prompt' current_source/windows/server.py
+          grep -q 'primitive_signal' current_source/windows/server.py
+          grep -q 'PCREMOTE_VERSION = "6.3.2"' current_source/windows/server.py
+          python3 -m py_compile current_source/windows/server.py current_source/windows/gui.py
+      - name: Commit patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add current_source/windows/server.py
+          git commit -m "Detect prompt strings through workflow graph connections"
+          git push
