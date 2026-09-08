@@ -1087,6 +1087,14 @@ final class APIClient {
         ])
     }
 
+    func comfySetMainPrompts(workflowID: String, positive: String, negative: String) async throws {
+        try await action(path: "/api/comfy/prompt/set", object: [
+            "workflow_id": workflowID,
+            "positive": positive,
+            "negative": negative,
+        ])
+    }
+
     func comfyNodeCatalog(query: String = "") async throws -> ComfyNodeCatalogResponse {
         var components = URLComponents()
         components.path = "/api/comfy/nodes/catalog"

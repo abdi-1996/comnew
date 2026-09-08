@@ -1822,6 +1822,7 @@ final class ComfyUIModel: ObservableObject {
     private var pollTask: Task<Void, Never>?
     private var positivePromptNodeIDs = Set<String>()
     private var negativePromptNodeIDs = Set<String>()
+    private var promptSyncTask: Task<Void, Never>?
 
     init(device: SavedDevice, app: RemoteApp? = nil) {
         self.device = device
@@ -1924,6 +1925,33 @@ final class ComfyUIModel: ObservableObject {
         UserDefaults.standard.set(enabled, forKey: outputOnlyKey(for: selectedWorkflowID))
     }
 
+    func schedulePromptSync() {
+        guard available, !selectedWorkflowID.isEmpty else { return }
+        promptSyncTask?.cancel()
+        let workflowID = selectedWorkflowID
+        let positive = parameters.positive
+        let negative = parameters.negative
+        promptSyncTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: 450_000_000)
+                guard !Task.isCancelled, let self else { return }
+                try await self.client.comfySetMainPrompts(
+                    workflowID: workflowID,
+                    positive: positive,
+                    negative: negative
+                )
+                if self.selectedWorkflowID == workflowID {
+                    await self.loadWorkflowDetails()
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled else { return }
+                self?.errorMessage = error.localizedDescription
+            }
+        }
+    }
+
     var currentNodeDisplayName: String {
         guard let nodeID = dashboard?.currentNode, !nodeID.isEmpty else { return "" }
         if let node = workflowDetails?.nodes.first(where: { $0.id == nodeID }) {
@@ -2007,6 +2035,7 @@ final class ComfyUIModel: ObservableObject {
     }
 
     func selectWorkflow(_ workflow: ComfyWorkflow) async {
+        promptSyncTask?.cancel()
         selectedWorkflowID = workflow.id
         workflowDetails = nil
         await refresh(loadParameters: true)
@@ -2425,13 +2454,25 @@ struct ComfyUIView: View {
                         promptCard(
                             title: "Positive Prompt",
                             systemImage: "sparkles",
-                            text: $model.parameters.positive,
+                            text: Binding(
+                                get: { model.parameters.positive },
+                                set: { value in
+                                    model.parameters.positive = value
+                                    model.schedulePromptSync()
+                                }
+                            ),
                             withTemplates: true
                         )
                         promptCard(
                             title: "Negative Prompt",
                             systemImage: "minus.circle",
-                            text: $model.parameters.negative,
+                            text: Binding(
+                                get: { model.parameters.negative },
+                                set: { value in
+                                    model.parameters.negative = value
+                                    model.schedulePromptSync()
+                                }
+                            ),
                             withTemplates: false
                         )
 

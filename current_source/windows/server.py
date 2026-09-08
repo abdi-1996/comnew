@@ -45,7 +45,7 @@ pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0.01
 
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
-PCREMOTE_VERSION = "6.3.0"
+PCREMOTE_VERSION = "6.3.1"
 CONFIG_PATH = APP_DIR / "config.json"
 ICON_CACHE_DIR = APP_DIR / "icon_cache"
 ICON_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1568,13 +1568,44 @@ def _find_node(prompt, class_contains):
     return None, None
 
 
-def _upstream_text_nodes(prompt, start_ref, max_depth=12):
-    """Return text-bearing nodes reachable upstream from a conditioning ref.
+def _prompt_scalar_keys(inputs):
+    """Return scalar fields that are very likely to contain the user prompt."""
+    if not isinstance(inputs, dict):
+        return []
+    exact = {
+        "text", "prompt", "caption", "text_g", "text_l", "text_1", "text_2",
+        "positive", "negative", "positive_prompt", "negative_prompt",
+        "prompt_text", "positive_text", "negative_text", "description",
+    }
+    result = []
+    for key, value in inputs.items():
+        if not isinstance(value, str):
+            continue
+        low = str(key).lower().replace("-", "_").strip()
+        if low in exact or "prompt" in low or "caption" in low:
+            result.append(key)
+    return result
 
-    Modern workflows often put CLIP text encoders behind conditioning helper
-    nodes.  Following all graph references fixes main-screen prompt edits for
-    SDXL, Z-Image and custom conditioning chains instead of assuming the
-    sampler points directly at CLIPTextEncode.
+
+def _prompt_node_identity(node):
+    if not isinstance(node, dict):
+        return ""
+    meta = node.get("_meta") if isinstance(node.get("_meta"), dict) else {}
+    return (str(node.get("class_type") or "") + " " + str(meta.get("title") or "")).lower()
+
+
+def _prompt_target_is_negative(node, keys):
+    identity = _prompt_node_identity(node)
+    if "negative" in identity or "neg prompt" in identity or "neg_prompt" in identity:
+        return True
+    return any("negative" in str(key).lower() or str(key).lower().startswith("neg_") for key in keys)
+
+
+def _upstream_text_nodes(prompt, start_ref, max_depth=18):
+    """Return prompt-bearing scalar nodes reachable upstream from a graph ref.
+
+    Custom WAN/LTX/Qwen/Flux nodes often expose a prompt string without
+    "text" or "encode" in their class name, so class-name filtering is unsafe.
     """
     if not isinstance(start_ref, list) or not start_ref:
         return []
@@ -1590,53 +1621,108 @@ def _upstream_text_nodes(prompt, start_ref, max_depth=12):
         if not isinstance(node, dict):
             continue
         inputs = node.get("inputs") if isinstance(node.get("inputs"), dict) else {}
-        text_keys = [key for key, value in inputs.items()
-                     if isinstance(value, str) and str(key).lower() in {"text", "prompt", "positive", "negative", "caption", "text_g", "text_l"}]
-        class_low = str(node.get("class_type", "")).lower()
-        if text_keys and ("text" in class_low or "clip" in class_low or "encode" in class_low or "prompt" in class_low):
+        text_keys = _prompt_scalar_keys(inputs)
+        if text_keys:
             found.append((str(node_id), node, text_keys))
         for value in inputs.values():
-            if isinstance(value, list) and len(value) >= 2 and isinstance(value[1], int):
+            if isinstance(value, list) and len(value) >= 2 and isinstance(value[0], (str, int)) and isinstance(value[1], int):
                 pending.append((str(value[0]), depth + 1))
     return found
 
 
 def _prompt_text_targets(prompt, sampler_inputs, kind):
+    kind = "negative" if str(kind).lower().startswith("neg") else "positive"
     refs = []
-    ref = sampler_inputs.get(kind) if isinstance(sampler_inputs, dict) else None
-    if isinstance(ref, list): refs.append(ref)
-    # SamplerCustom/Guider workflows keep conditioning on a separate guider.
-    # Scan the graph for positive/negative connection inputs instead of tying
-    # the main prompt editor to one specific sampler class.
+
+    def add_ref(value):
+        if isinstance(value, list) and len(value) >= 1 and value not in refs:
+            refs.append(value)
+
+    if isinstance(sampler_inputs, dict):
+        add_ref(sampler_inputs.get(kind))
+
+    # Scan all guider/conditioning inputs. Many modern workflows use
+    # conditioning/cond instead of a literal "positive" input.
     for node in prompt.values() if isinstance(prompt, dict) else []:
-        inputs = node.get("inputs") if isinstance(node, dict) and isinstance(node.get("inputs"), dict) else {}
-        candidate = inputs.get(kind)
-        if isinstance(candidate, list) and candidate not in refs:
-            refs.append(candidate)
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs") if isinstance(node.get("inputs"), dict) else {}
+        identity = _prompt_node_identity(node)
+        for input_name, candidate in inputs.items():
+            if not isinstance(candidate, list):
+                continue
+            low = str(input_name).lower().replace("-", "_")
+            if kind == "negative":
+                if "negative" in low or low in {"neg", "negative_cond", "negative_conditioning"}:
+                    add_ref(candidate)
+            else:
+                if "positive" in low:
+                    add_ref(candidate)
+                elif (
+                    low in {"conditioning", "condition", "cond", "prompt", "positive_cond", "positive_conditioning"}
+                    and any(token in identity for token in ("guider", "guidance", "conditioning", "cfg"))
+                ):
+                    add_ref(candidate)
+
     targets = []
     seen = set()
     for candidate in refs:
+        direct_negative = False
+        if kind == "negative":
+            direct_negative = any(
+                isinstance(node, dict)
+                and any(
+                    isinstance(v, list) and v == candidate and "negative" in str(k).lower()
+                    for k, v in (node.get("inputs") or {}).items()
+                )
+                for node in prompt.values()
+            )
         for target in _upstream_text_nodes(prompt, candidate):
             key = (target[0], tuple(target[2]))
-            if key not in seen:
-                seen.add(key); targets.append(target)
+            if key in seen:
+                continue
+            if kind == "positive" and _prompt_target_is_negative(target[1], target[2]):
+                continue
+            if kind == "negative" and not _prompt_target_is_negative(target[1], target[2]) and not direct_negative:
+                continue
+            seen.add(key)
+            targets.append(target)
     if targets:
         return targets
-    # Title-based fallback for workflows whose sampler/guider uses custom names.
-    results = []
+
+    labelled = []
+    all_candidates = []
     for node_id, node in prompt.items() if isinstance(prompt, dict) else []:
         if not isinstance(node, dict):
             continue
         inputs = node.get("inputs") if isinstance(node.get("inputs"), dict) else {}
-        text_keys = [key for key, value in inputs.items() if isinstance(value, str) and str(key).lower() in {"text", "prompt", "positive", "negative", "caption", "text_g", "text_l"}]
+        text_keys = _prompt_scalar_keys(inputs)
         if not text_keys:
             continue
-        title = str((node.get("_meta") or {}).get("title", "")).lower() if isinstance(node.get("_meta"), dict) else ""
-        class_low = str(node.get("class_type", "")).lower()
-        if kind in title or kind in class_low:
-            results.append((str(node_id), node, text_keys))
-    return results
+        candidate = (str(node_id), node, text_keys)
+        all_candidates.append(candidate)
+        identity = _prompt_node_identity(node)
+        key_identity = " ".join(str(k).lower() for k in text_keys)
+        if kind in identity or kind in key_identity:
+            labelled.append(candidate)
+    if labelled:
+        return labelled
 
+    # Never guess a negative prompt. For positive, choose one generic prompt
+    # node only as a final fallback so the main Prompt tab is not blank.
+    if kind == "positive":
+        non_negative = [item for item in all_candidates if not _prompt_target_is_negative(item[1], item[2])]
+        if len(non_negative) == 1:
+            return non_negative
+        preferred = [
+            item for item in non_negative
+            if any(token in _prompt_node_identity(item[1]) for token in ("text", "clip", "encode", "prompt", "caption", "wan", "ltx", "qwen", "flux"))
+        ]
+        if preferred:
+            return [preferred[0]]
+        if non_negative:
+            return [non_negative[0]]
+    return []
 
 def _read_target_text(targets):
     for _, node, keys in targets:
@@ -3182,7 +3268,8 @@ def comfy_dashboard():
     selected_id, prompt = _load_workflow(requested)
     if prompt is None and catalog:
         selected_id, prompt = _load_workflow(catalog[0]["id"])
-    parameters = _extract_workflow_parameters(prompt or {})
+    effective_prompt = _apply_editor_overrides(selected_id, prompt) if selected_id and _is_api_workflow(prompt) else (prompt or {})
+    parameters = _extract_workflow_parameters(effective_prompt)
 
     checkpoints = _comfy_models("checkpoints")
     loras = _comfy_models("loras")
@@ -3194,7 +3281,7 @@ def comfy_dashboard():
         system_stats = {}
     gpu, vram = _comfy_system_label(system_stats)
     system = _comfy_system_metrics(system_stats)
-    profile_prompt = _apply_editor_overrides(selected_id, prompt) if selected_id and _is_api_workflow(prompt) else (prompt or {})
+    profile_prompt = effective_prompt
     model_profile, media_type = _detect_model_profile(profile_prompt)
 
     state = _comfy_state_copy()
@@ -3261,6 +3348,60 @@ def comfy_workflow_node_update():
     _update_workflow_editor_state(workflow_id, mutate)
     _persist_workflow_node_change(workflow_id, node_id, body)
     return jsonify({"ok": True, "error": None})
+
+
+@app.post("/api/comfy/prompt/set")
+def comfy_prompt_set():
+    """Persist the main Prompt tab into the real prompt-bearing workflow nodes."""
+    body = request.get_json(silent=True) or {}
+    workflow_id = str(body.get("workflow_id") or "")
+    if not workflow_id:
+        return jsonify({"ok": False, "error": "Не указан workflow."}), 400
+
+    selected_id, prompt = _load_workflow(workflow_id)
+    if prompt is None or not _is_api_workflow(prompt):
+        return jsonify({"ok": False, "error": "Для Prompt нужен API-format workflow."}), 400
+
+    effective = _apply_editor_overrides(selected_id, prompt)
+    _, sampler = _find_node(effective, ("ksampler", "samplercustom", "sampler"))
+    sampler_inputs = sampler.get("inputs", {}) if isinstance(sampler, dict) else {}
+
+    positive_targets = _prompt_text_targets(effective, sampler_inputs, "positive")
+    negative_targets = _prompt_text_targets(effective, sampler_inputs, "negative")
+
+    positive = body.get("positive")
+    negative = body.get("negative")
+    changed = 0
+
+    def persist_targets(targets, value):
+        nonlocal changed
+        if not isinstance(value, str):
+            return
+        for node_id, _node, keys in targets:
+            for key in keys:
+                _set_workflow_scalar_input(selected_id, node_id, key, value)
+                changed += 1
+
+    persist_targets(positive_targets, positive)
+    persist_targets(negative_targets, negative)
+
+    if isinstance(positive, str) and not positive_targets:
+        return jsonify({
+            "ok": False,
+            "error": "Не удалось определить Positive Prompt ноду. Откройте Node Editor и проверьте текстовую ноду workflow."
+        }), 422
+
+    refreshed = _apply_editor_overrides(selected_id, prompt)
+    params = _extract_workflow_parameters(refreshed)
+    return jsonify({
+        "ok": True,
+        "error": None,
+        "changed": changed,
+        "positive": params.get("positive", ""),
+        "negative": params.get("negative", ""),
+        "positive_nodes": [item[0] for item in positive_targets],
+        "negative_nodes": [item[0] for item in negative_targets],
+    })
 
 
 @app.post("/api/comfy/workflow/order")

@@ -1,3 +1,12 @@
+# Version 2.2.1
+
+Исправлено:
+- Prompt теперь загружается из реальных prompt/text нод выбранного ComfyUI workflow.
+- Учитываются editor overrides, поэтому вкладка Prompt больше не показывает устаревший исходный JSON.
+- Добавлена поддержка custom guider / conditioning цепочек WAN, LTX, Qwen, Flux и сторонних нод.
+- Изменение Positive/Negative Prompt записывается обратно в workflow автоматически с debounce 450 мс.
+- Prompt больше не ждёт нажатия Generate для синхронизации с workflow.
+
 # Version 2.2.0 — build 17
 
 Добавлено:
