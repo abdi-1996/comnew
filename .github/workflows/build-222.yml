@@ -1,0 +1,238 @@
+name: Build Comfy Remote 2.2.2 + Server 6.3.2
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-222.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  ios:
+    name: Build Comfy Remote 2.2.2 IPA
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify source
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE/current_source"
+          PROJECT="$ROOT/ios/PCRemote/PCRemote.xcodeproj"
+          test -d "$PROJECT"
+          grep -q '2.2.2 build 19' "$ROOT/VERSION.txt"
+          grep -q 'func schedulePromptSync' "$ROOT/ios/PCRemote/PCRemote/MainView.swift"
+          grep -q 'func comfySetMainPrompts' "$ROOT/ios/PCRemote/PCRemote/APIClient.swift"
+          grep -q 'promptSyncTask?.cancel()' "$ROOT/ios/PCRemote/PCRemote/MainView.swift"
+          grep -q 'PCREMOTE_VERSION = "6.3.2"' "$ROOT/windows/server.py"
+          python3 -m py_compile "$ROOT/windows/server.py" "$ROOT/windows/gui.py"
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+          echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
+
+      - name: Test prompt target resolver
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ast
+          from pathlib import Path
+          src=Path('current_source/windows/server.py').read_text(encoding='utf-8')
+          tree=ast.parse(src)
+          wanted={'_details_prompt_targets','_fill_prompt_parameters_from_details'}
+          body=[n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in wanted]
+          ns={}
+          exec(compile(ast.Module(body=body,type_ignores=[]),'<prompt-test>','exec'),ns)
+          f=ns['_details_prompt_targets']
+          details={
+            'nodes':[
+              {'id':'1','class_type':'PrimitiveStringMultiline','title':'Prompt text','inputs':[{'name':'value','value':'a cinematic character walking in rain','value_type':'string','input_type':'STRING'}]},
+              {'id':'2','class_type':'CLIPTextEncode','title':'Encode','inputs':[{'name':'clip','value':'Connected','value_type':'connection','input_type':'CLIP'}]},
+            ],
+            'connections':[{'from':'1','to':'2','input_name':'text','label':'STRING'}],
+          }
+          targets=f(details,'positive')
+          assert targets and targets[0]['node_id']=='1' and targets[0]['input_name']=='value', targets
+          ui={
+            'nodes':[{'id':'9','class_type':'CustomPromptNode','title':'Positive Prompt','inputs':[{'name':'prompt','value':'hello world prompt','value_type':'string','input_type':'STRING'}]}],
+            'connections':[],
+          }
+          targets=f(ui,'positive')
+          assert targets and targets[0]['node_id']=='9', targets
+          print('prompt resolver tests passed')
+          PY
+
+      - name: Download llama.cpp iOS XCFramework
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PROJECT_DIR="$(dirname "${{ steps.source.outputs.project }}")"
+          VENDOR_DIR="$PROJECT_DIR/Vendor"
+          TMP_DIR="$RUNNER_TEMP/llama-xcframework"
+          rm -rf "$TMP_DIR" "$VENDOR_DIR/llama.xcframework"
+          mkdir -p "$TMP_DIR" "$VENDOR_DIR"
+          export TMP_DIR
+          python3 - <<'PY'
+          import json, os, urllib.request
+          tag='b10453'
+          api=f'https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/{tag}'
+          headers={'Accept':'application/vnd.github+json','User-Agent':'ComfyRemote-Build'}
+          token=os.environ.get('GH_TOKEN')
+          if token: headers['Authorization']=f'Bearer {token}'
+          with urllib.request.urlopen(urllib.request.Request(api, headers=headers), timeout=60) as r:
+              release=json.load(r)
+          assets=[a for a in release.get('assets',[]) if 'xcframework' in a.get('name','').lower() and a.get('name','').lower().endswith('.zip')]
+          if not assets: raise SystemExit('No llama.cpp XCFramework asset found')
+          asset=assets[0]
+          out=os.path.join(os.environ['TMP_DIR'],asset['name'])
+          with urllib.request.urlopen(urllib.request.Request(asset['browser_download_url'],headers={'User-Agent':'ComfyRemote-Build'}),timeout=180) as src, open(out,'wb') as dst:
+              while True:
+                  chunk=src.read(1024*1024)
+                  if not chunk: break
+                  dst.write(chunk)
+          PY
+          LLAMA_ZIP="$(find "$TMP_DIR" -maxdepth 1 -type f -name '*xcframework*.zip' -print -quit)"
+          test -n "$LLAMA_ZIP"
+          unzip -q "$LLAMA_ZIP" -d "$TMP_DIR/unpacked"
+          XC_PATH="$(find "$TMP_DIR/unpacked" -type d -name 'llama.xcframework' -print -quit)"
+          test -n "$XC_PATH"
+          cp -R "$XC_PATH" "$VENDOR_DIR/llama.xcframework"
+          test -f "$VENDOR_DIR/llama.xcframework/Info.plist"
+
+      - name: Build iPhone app
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project "${{ steps.source.outputs.project }}" \
+            -scheme PCRemote \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath "$GITHUB_WORKSPACE/ios-build" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            clean build
+
+      - name: Package IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="$(find "$GITHUB_WORKSPACE/ios-build/Build/Products/Release-iphoneos" -type d -name 'PCRemote.app' -print -quit)"
+          test -n "$APP"
+          test -f "$APP/Frameworks/llama.framework/llama"
+          export PLIST="$APP/Info.plist"
+          python3 - <<'PY'
+          import os, plistlib
+          p=os.environ['PLIST']
+          with open(p,'rb') as f: info=plistlib.load(f)
+          info['NSAppTransportSecurity']={'NSAllowsArbitraryLoads':True,'NSAllowsLocalNetworking':True}
+          with open(p,'wb') as f: plistlib.dump(info,f,fmt=plistlib.FMT_BINARY)
+          assert str(info.get('CFBundleShortVersionString')) == '2.2.2', info.get('CFBundleShortVersionString')
+          assert str(info.get('CFBundleVersion')) == '19', info.get('CFBundleVersion')
+          print('Version', info.get('CFBundleShortVersionString'), 'Build', info.get('CFBundleVersion'))
+          PY
+          cd "$GITHUB_WORKSPACE"
+          rm -rf Payload ComfyRemote-2.2.2.ipa ipa-check
+          mkdir Payload
+          cp -R "$APP" Payload/PCRemote.app
+          zip -qry ComfyRemote-2.2.2.ipa Payload
+          mkdir ipa-check
+          unzip -q ComfyRemote-2.2.2.ipa -d ipa-check
+          test -f ipa-check/Payload/PCRemote.app/Info.plist
+          test -f ipa-check/Payload/PCRemote.app/Frameworks/llama.framework/llama
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ComfyRemote-2.2.2-build19-IPA
+          path: ComfyRemote-2.2.2.ipa
+          if-no-files-found: error
+
+  windows:
+    name: Build PCRemoteServer 6.3.2 EXE
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify server source
+        id: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $dir=Join-Path $env:GITHUB_WORKSPACE 'current_source\windows'
+          $gui=Join-Path $dir 'gui.py'
+          python -m py_compile (Join-Path $dir 'server.py') $gui (Join-Path $dir 'corel_bridge.py')
+          if (-not (Select-String -Path (Join-Path $dir 'server.py') -Pattern 'PCREMOTE_VERSION = "6.3.2"' -Quiet)) { throw '6.3.2 marker missing' }
+          "dir=$dir" >> $env:GITHUB_OUTPUT
+          "gui=$gui" >> $env:GITHUB_OUTPUT
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip pyinstaller
+          $req="${{ steps.source.outputs.dir }}\requirements.txt"
+          if (Test-Path $req) { python -m pip install -r $req }
+
+      - name: Build server EXE
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed `
+            --paths "${{ steps.source.outputs.dir }}" `
+            --collect-all mss --collect-all pyautogui --collect-all comtypes `
+            --hidden-import comtypes.client --hidden-import corel_bridge `
+            --hidden-import pyperclip --hidden-import psutil --hidden-import websocket --hidden-import winreg `
+            --name PCRemoteServer "${{ steps.source.outputs.gui }}"
+
+      - name: Smoke test server
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          Get-Process PCRemoteServer -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          $exe=Resolve-Path 'dist\PCRemoteServer.exe'
+          $stable=Join-Path $env:LOCALAPPDATA 'PCRemoteServer'
+          New-Item -ItemType Directory -Force -Path $stable | Out-Null
+          $stableExe=Join-Path $stable 'PCRemoteServer.exe'
+          Copy-Item $exe $stableExe -Force
+          $proc=Start-Process -FilePath $stableExe -WorkingDirectory $stable -PassThru
+          try {
+            $ok=$false
+            for ($i=0; $i -lt 40; $i++) {
+              Start-Sleep -Milliseconds 750
+              try {
+                $r=Invoke-RestMethod -Uri 'http://127.0.0.1:8765/api/ping' -TimeoutSec 2
+                if ($r.ok -eq $true -and $r.server_version -eq '6.3.2') { $ok=$true; break }
+              } catch {}
+              if ($proc.HasExited) { throw "Server exited: $($proc.ExitCode)" }
+            }
+            if (-not $ok) { throw 'Server 6.3.2 did not answer /api/ping' }
+          } finally {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            Get-Process PCRemoteServer -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Package Windows server
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path 'PCRemote-Windows' | Out-Null
+          Copy-Item 'dist\PCRemoteServer.exe' 'PCRemote-Windows\PCRemoteServer.exe'
+          foreach ($name in @('SETUP_NETWORK_ADMIN.ps1','SETUP_NETWORK_ADMIN.bat','CHECK_NETWORK.ps1','INSTALL_STABLE_SERVER.ps1','INSTALL_STABLE_SERVER.bat')) {
+            $src=Join-Path "${{ steps.source.outputs.dir }}" $name
+            if (Test-Path $src) { Copy-Item $src (Join-Path 'PCRemote-Windows' $name) }
+          }
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: PCRemoteServer-6.3.2-Stable
+          path: PCRemote-Windows
+          if-no-files-found: error
