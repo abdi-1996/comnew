@@ -1,0 +1,49 @@
+name: Apply Comfy Remote 2.2.1 Prompt Fix
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/upgrade-221.yml"
+      - "tools/upgrade_221.py"
+
+permissions:
+  contents: write
+
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Apply prompt fix
+        run: python3 tools/upgrade_221.py
+
+      - name: Validate upgraded source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile current_source/windows/server.py
+          grep -q 'PCREMOTE_VERSION = "6.3.1"' current_source/windows/server.py
+          grep -q 'def comfy_prompt_set' current_source/windows/server.py
+          grep -q 'effective_prompt = _apply_editor_overrides' current_source/windows/server.py
+          grep -q 'func comfySetMainPrompts' current_source/ios/PCRemote/PCRemote/APIClient.swift
+          grep -q 'func schedulePromptSync' current_source/ios/PCRemote/PCRemote/MainView.swift
+          grep -q '2.2.1' current_source/ios/PCRemote/PCRemote/Info.plist
+          grep -q '2.2.1 build 18' current_source/VERSION.txt
+
+      - name: Commit upgraded source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add current_source
+          if git diff --cached --quiet; then
+            echo "No source changes"
+            exit 0
+          fi
+          git commit -m "Fix Comfy Remote prompt sync in 2.2.1"
+          git push
