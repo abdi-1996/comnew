@@ -1,0 +1,41 @@
+name: Apply Comfy Remote 2.2.2 Prompt UI Fix
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/upgrade-222.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply 2.2.2 upgrade
+        run: python3 tools/upgrade_222.py
+      - name: Validate upgraded source
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q '2.2.2 build 19' current_source/VERSION.txt
+          grep -q 'PCRemoteServer 6.3.2' current_source/VERSION.txt
+          grep -q 'PCREMOTE_VERSION = "6.3.2"' current_source/windows/server.py
+          grep -q 'def _details_prompt_targets' current_source/windows/server.py
+          grep -q 'Supports API-format and ComfyUI UI-format workflows' current_source/windows/server.py
+          grep -q 'promptSyncTask?.cancel()' current_source/ios/PCRemote/PCRemote/MainView.swift
+          grep -q 'MARKETING_VERSION = 2.2.2;' current_source/ios/PCRemote/PCRemote.xcodeproj/project.pbxproj
+          grep -q 'CURRENT_PROJECT_VERSION = 19;' current_source/ios/PCRemote/PCRemote.xcodeproj/project.pbxproj
+          python3 -m py_compile current_source/windows/server.py current_source/windows/gui.py
+      - name: Commit upgraded source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add current_source
+          git commit -m "Fix prompt sync for UI workflows in 2.2.2"
+          git push
