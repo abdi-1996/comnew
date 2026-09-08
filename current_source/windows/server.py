@@ -45,7 +45,7 @@ pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0.01
 
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
-PCREMOTE_VERSION = "6.3.1"
+PCREMOTE_VERSION = "6.3.2"
 CONFIG_PATH = APP_DIR / "config.json"
 ICON_CACHE_DIR = APP_DIR / "icon_cache"
 ICON_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1748,6 +1748,132 @@ def _write_target_text(targets, value):
     return changed
 
 
+def _details_prompt_targets(details, kind):
+    """Find prompt-bearing scalar inputs in normalized workflow details.
+
+    This works for both API-format and ComfyUI UI-format workflows because
+    _workflow_details() exposes both as the same node/input structure.
+    """
+    kind = "negative" if str(kind).lower().startswith("neg") else "positive"
+    nodes = details.get("nodes") if isinstance(details, dict) else None
+    if not isinstance(nodes, list):
+        return []
+
+    ranked = []
+    blocked_names = {
+        "filename", "file", "path", "url", "image", "video", "audio", "sound",
+        "ckpt_name", "checkpoint", "model", "model_name", "unet_name", "vae_name",
+        "lora_name", "sampler_name", "scheduler", "device", "dtype", "format",
+        "prefix", "output", "output_path", "save_path", "directory", "folder",
+    }
+
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        node_id = str(node.get("id") or "")
+        identity = (str(node.get("class_type") or "") + " " + str(node.get("title") or "")).lower()
+        identity_norm = identity.replace("-", "_")
+        node_negative = any(token in identity_norm for token in ("negative", "neg_prompt", "neg prompt"))
+        node_positive = "positive" in identity_norm or "pos_prompt" in identity_norm or "pos prompt" in identity_norm
+
+        for input_item in node.get("inputs") or []:
+            if not isinstance(input_item, dict):
+                continue
+            if str(input_item.get("value_type") or "").lower() == "connection":
+                continue
+            value_type = str(input_item.get("value_type") or "").lower()
+            input_type = str(input_item.get("input_type") or "").upper()
+            if value_type not in {"string", "json", ""} and input_type != "STRING":
+                continue
+            value = input_item.get("value")
+            if not isinstance(value, str):
+                continue
+            name = str(input_item.get("name") or "")
+            low = name.lower().replace("-", "_").strip()
+            if not low:
+                continue
+
+            negative_signal = node_negative or "negative" in low or low.startswith("neg_") or low in {"neg", "negative_text"}
+            positive_signal = node_positive or "positive" in low or low.startswith("pos_")
+            prompt_signal = "prompt" in low
+            caption_signal = "caption" in low
+            text_signal = low in {"text", "text_g", "text_l", "text_1", "text_2", "description", "instruction"} or low.startswith("text_") or low.endswith("_text")
+            identity_signal = any(token in identity_norm for token in ("prompt", "text", "clip", "encode", "caption", "conditioning"))
+
+            if low in blocked_names and not (prompt_signal or caption_signal or text_signal or positive_signal or negative_signal):
+                continue
+            if any(token in low for token in ("filename", "filepath", "file_path", "model_name", "ckpt", "checkpoint", "lora_name", "vae_name", "sampler", "scheduler")) and not prompt_signal:
+                continue
+
+            if kind == "negative":
+                if not negative_signal:
+                    continue
+            else:
+                if negative_signal:
+                    continue
+                if not (positive_signal or prompt_signal or caption_signal or text_signal or identity_signal):
+                    continue
+
+            score = 0
+            if kind == "negative" and negative_signal:
+                score += 180
+            if kind == "positive" and positive_signal:
+                score += 170
+            if prompt_signal:
+                score += 145
+            if caption_signal:
+                score += 125
+            if low in {"text", "text_g", "text_l", "text_1", "text_2"} or low.startswith("text_"):
+                score += 110
+            if low in {"description", "instruction"}:
+                score += 95
+            if (kind == "negative" and node_negative) or (kind == "positive" and node_positive):
+                score += 115
+            if "prompt" in identity_norm:
+                score += 90
+            if any(token in identity_norm for token in ("text", "clip", "encode", "caption")):
+                score += 55
+            if len(value.strip()) >= 12:
+                score += 12
+            if any(ch.isspace() for ch in value.strip()):
+                score += 8
+
+            ranked.append({
+                "score": score,
+                "node_id": node_id,
+                "input_name": name,
+                "value": value,
+            })
+
+    if not ranked:
+        return []
+    ranked.sort(key=lambda item: (-int(item["score"]), item["node_id"], item["input_name"]))
+    best = ranked[0]
+    best_node = best["node_id"]
+    best_score = int(best["score"])
+    selected = [
+        item for item in ranked
+        if item["node_id"] == best_node and int(item["score"]) >= best_score - 35
+    ]
+    return selected or [best]
+
+
+def _fill_prompt_parameters_from_details(params, details):
+    if not isinstance(params, dict):
+        return params
+    positive = _details_prompt_targets(details, "positive")
+    negative = _details_prompt_targets(details, "negative")
+    if not str(params.get("positive") or "").strip() and positive:
+        value = str(positive[0].get("value") or "")
+        if value.strip():
+            params["positive"] = value
+    if not str(params.get("negative") or "").strip() and negative:
+        value = str(negative[0].get("value") or "")
+        if value.strip():
+            params["negative"] = value
+    return params
+
+
 def _extract_workflow_parameters(prompt):
     params = {
         "positive": "", "negative": "", "steps": 20, "cfg": 7.0, "seed": 0,
@@ -3269,7 +3395,12 @@ def comfy_dashboard():
     if prompt is None and catalog:
         selected_id, prompt = _load_workflow(catalog[0]["id"])
     effective_prompt = _apply_editor_overrides(selected_id, prompt) if selected_id and _is_api_workflow(prompt) else (prompt or {})
-    parameters = _extract_workflow_parameters(effective_prompt)
+    parameters = _extract_workflow_parameters(effective_prompt if _is_api_workflow(effective_prompt) else {})
+    if selected_id:
+        try:
+            parameters = _fill_prompt_parameters_from_details(parameters, _workflow_details(selected_id))
+        except Exception:
+            pass
 
     checkpoints = _comfy_models("checkpoints")
     loras = _comfy_models("loras")
@@ -3352,35 +3483,67 @@ def comfy_workflow_node_update():
 
 @app.post("/api/comfy/prompt/set")
 def comfy_prompt_set():
-    """Persist the main Prompt tab into the real prompt-bearing workflow nodes."""
+    """Persist the main Prompt tab into real workflow text inputs.
+
+    Supports API-format and ComfyUI UI-format workflows. Normalized workflow
+    details are used as a fallback for custom nodes that do not expose the
+    classic KSampler -> CLIPTextEncode graph shape.
+    """
     body = request.get_json(silent=True) or {}
     workflow_id = str(body.get("workflow_id") or "")
     if not workflow_id:
         return jsonify({"ok": False, "error": "Не указан workflow."}), 400
 
     selected_id, prompt = _load_workflow(workflow_id)
-    if prompt is None or not _is_api_workflow(prompt):
-        return jsonify({"ok": False, "error": "Для Prompt нужен API-format workflow."}), 400
-
-    effective = _apply_editor_overrides(selected_id, prompt)
-    _, sampler = _find_node(effective, ("ksampler", "samplercustom", "sampler"))
-    sampler_inputs = sampler.get("inputs", {}) if isinstance(sampler, dict) else {}
-
-    positive_targets = _prompt_text_targets(effective, sampler_inputs, "positive")
-    negative_targets = _prompt_text_targets(effective, sampler_inputs, "negative")
+    if prompt is None:
+        return jsonify({"ok": False, "error": "Workflow не найден."}), 404
 
     positive = body.get("positive")
     negative = body.get("negative")
+
+    def flatten_api_targets(targets):
+        out = []
+        for node_id, node, keys in targets:
+            inputs = node.get("inputs", {}) if isinstance(node, dict) else {}
+            for key in keys:
+                out.append({
+                    "node_id": str(node_id),
+                    "input_name": str(key),
+                    "value": inputs.get(key) if isinstance(inputs.get(key), str) else "",
+                })
+        return out
+
+    positive_targets = []
+    negative_targets = []
+    if _is_api_workflow(prompt):
+        effective = _apply_editor_overrides(selected_id, prompt)
+        _, sampler = _find_node(effective, ("ksampler", "samplercustom", "sampler"))
+        sampler_inputs = sampler.get("inputs", {}) if isinstance(sampler, dict) else {}
+        positive_targets = flatten_api_targets(_prompt_text_targets(effective, sampler_inputs, "positive"))
+        negative_targets = flatten_api_targets(_prompt_text_targets(effective, sampler_inputs, "negative"))
+
+    details = _workflow_details(selected_id)
+    if not positive_targets:
+        positive_targets = _details_prompt_targets(details, "positive")
+    if not negative_targets:
+        negative_targets = _details_prompt_targets(details, "negative")
+
     changed = 0
 
     def persist_targets(targets, value):
         nonlocal changed
         if not isinstance(value, str):
             return
-        for node_id, _node, keys in targets:
-            for key in keys:
-                _set_workflow_scalar_input(selected_id, node_id, key, value)
-                changed += 1
+        seen = set()
+        for target in targets:
+            node_id = str(target.get("node_id") or "")
+            input_name = str(target.get("input_name") or "")
+            key = (node_id, input_name)
+            if not node_id or not input_name or key in seen:
+                continue
+            seen.add(key)
+            _set_workflow_scalar_input(selected_id, node_id, input_name, value)
+            changed += 1
 
     persist_targets(positive_targets, positive)
     persist_targets(negative_targets, negative)
@@ -3391,16 +3554,25 @@ def comfy_prompt_set():
             "error": "Не удалось определить Positive Prompt ноду. Откройте Node Editor и проверьте текстовую ноду workflow."
         }), 422
 
-    refreshed = _apply_editor_overrides(selected_id, prompt)
-    params = _extract_workflow_parameters(refreshed)
+    refreshed_id, refreshed_prompt = _load_workflow(selected_id)
+    if refreshed_prompt is not None and _is_api_workflow(refreshed_prompt):
+        refreshed_effective = _apply_editor_overrides(refreshed_id, refreshed_prompt)
+        params = _extract_workflow_parameters(refreshed_effective)
+    else:
+        params = _extract_workflow_parameters({})
+    try:
+        params = _fill_prompt_parameters_from_details(params, _workflow_details(selected_id))
+    except Exception:
+        pass
+
     return jsonify({
         "ok": True,
         "error": None,
         "changed": changed,
         "positive": params.get("positive", ""),
         "negative": params.get("negative", ""),
-        "positive_nodes": [item[0] for item in positive_targets],
-        "negative_nodes": [item[0] for item in negative_targets],
+        "positive_nodes": sorted({str(item.get("node_id") or "") for item in positive_targets if item.get("node_id")}),
+        "negative_nodes": sorted({str(item.get("node_id") or "") for item in negative_targets if item.get("node_id")}),
     })
 
 

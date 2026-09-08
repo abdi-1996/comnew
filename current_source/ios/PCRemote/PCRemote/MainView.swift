@@ -2278,11 +2278,15 @@ final class ComfyUIModel: ObservableObject {
             }
             if !staged.isEmpty { ComfyAdvancedDraftStore.clear(workflowID: selectedWorkflowID) }
 
-            // Main-screen prompt fields are authoritative. Write them through
-            // the same real node-update API used by Node Editor immediately
-            // before queueing the workflow. This fixes workflows where the
-            // server cannot infer the prompt node from a custom guider chain.
-            try await synchronizeMainScreenIntoWorkflow()
+            // Flush Prompt immediately through the server-side normalized node
+            // resolver. This covers API and UI-format/custom prompt nodes and
+            // avoids racing the 450 ms live-sync debounce when Generate is tapped.
+            promptSyncTask?.cancel()
+            try await client.comfySetMainPrompts(
+                workflowID: selectedWorkflowID,
+                positive: parameters.positive,
+                negative: parameters.negative
+            )
             let outputNodeID = (generateOnlySelectedOutput && !selectedOutputNodeID.isEmpty) ? selectedOutputNodeID : nil
             _ = try await client.comfyGenerate(workflowID: selectedWorkflowID, parameters: parameters, outputNodeID: outputNodeID)
             await refresh(loadParameters: false)
