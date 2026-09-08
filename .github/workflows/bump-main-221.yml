@@ -1,0 +1,41 @@
+name: Switch Main Build to 2.2.1
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/bump-main-221.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update main build versions
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('.github/workflows/main.yml')
+          s = p.read_text(encoding='utf-8')
+          s = s.replace('2.2.0', '2.2.1')
+          s = s.replace('6.3.0', '6.3.1')
+          s = s.replace('build17', 'build18')
+          s = s.replace("== '17'", "== '18'")
+          p.write_text(s, encoding='utf-8')
+      - name: Validate main workflow markers
+        run: |
+          grep -q 'Build Comfy Remote 2.2.1' .github/workflows/main.yml
+          grep -q 'PCREMOTE_VERSION = "6.3.1"' .github/workflows/main.yml
+          grep -q "CFBundleVersion')) == '18'" .github/workflows/main.yml
+          grep -q 'ComfyRemote-2.2.1-build18-IPA' .github/workflows/main.yml
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/workflows/main.yml
+          git commit -m "Build Comfy Remote 2.2.1 and Server 6.3.1"
+          git push
