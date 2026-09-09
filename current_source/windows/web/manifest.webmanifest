@@ -1,0 +1,14 @@
+{
+  "name": "Comfy Remote Web",
+  "short_name": "Comfy Remote",
+  "description": "Remote ComfyUI control through PCRemoteServer",
+  "start_url": "/web/",
+  "scope": "/web/",
+  "display": "standalone",
+  "background_color": "#050914",
+  "theme_color": "#07101f",
+  "orientation": "any",
+  "icons": [
+    {"src":"/web/icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any maskable"}
+  ]
+}
