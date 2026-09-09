@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#07101f">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Comfy Remote">
+  <title>Comfy Remote Web</title>
+  <link rel="manifest" href="/web/manifest.webmanifest">
+  <link rel="icon" href="/web/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/web/icon.svg">
+  <link rel="stylesheet" href="/web/styles.css">
+</head>
+<body>
+  <div class="aurora aurora-a"></div><div class="aurora aurora-b"></div>
+
+  <section id="loginScreen" class="login-screen">
+    <div class="login-card glass">
+      <div class="brand-mark">●●●</div>
+      <h1>Comfy Remote</h1>
+      <p class="muted">Web 1.0.0 · управление ComfyUI через PCRemoteServer</p>
+      <div id="pingInfo" class="connection-chip">Проверяем сервер…</div>
+      <label class="field-label" for="password">Пароль подключения</label>
+      <input id="password" class="input" type="password" autocomplete="current-password" placeholder="Пароль PC Remote Server">
+      <button id="loginBtn" class="button primary wide">Войти</button>
+      <details class="connection-id-box">
+        <summary>Войти через Connection ID</summary>
+        <textarea id="connectionId" class="textarea compact" placeholder="PCR1-…"></textarea>
+        <button id="connectionIdBtn" class="button secondary wide">Использовать Connection ID</button>
+      </details>
+      <p id="loginError" class="error-text"></p>
+    </div>
+  </section>
+
+  <div id="app" class="app hidden">
+    <header class="topbar glass">
+      <div>
+        <div class="eyebrow">COMFY REMOTE WEB</div>
+        <div class="top-title-row"><h1>ComfyUI</h1><span id="connectionDot" class="dot"></span><span id="connectionText">Connecting…</span></div>
+      </div>
+      <div class="top-actions">
+        <button id="refreshBtn" class="icon-button" title="Обновить">↻</button>
+        <button id="importWorkflowBtn" class="icon-button" title="Импорт workflow">＋</button>
+        <button id="nodesBtn" class="icon-button" title="Node Editor">◇</button>
+        <button id="logoutBtn" class="icon-button" title="Выйти">⋯</button>
+      </div>
+    </header>
+
+    <main class="page">
+      <section id="systemStats" class="stats-grid"></section>
+
+      <div class="layout-grid">
+        <div class="main-column">
+          <section class="card glass workflow-card">
+            <div class="card-icon gradient-icon">●●●</div>
+            <div class="workflow-body">
+              <div class="eyebrow cyan">WORKFLOW</div>
+              <select id="workflowSelect" class="select"></select>
+              <div id="workflowMeta" class="muted small">—</div>
+            </div>
+            <button id="workflowReloadBtn" class="icon-button">↻</button>
+          </section>
+
+          <div id="dynamicInputs"></div>
+
+          <section id="outputCard" class="card glass hidden">
+            <div class="section-head"><div><div class="eyebrow">GENERATE TARGET</div><h2>Output</h2></div><span id="outputCount" class="badge">0</span></div>
+            <select id="outputSelect" class="select"></select>
+            <label class="toggle-row"><span><b>Generate only selected output</b><small>Остальные output-ноды не будут учитываться.</small></span><input id="outputOnly" type="checkbox"></label>
+          </section>
+
+          <section class="card glass prompt-card">
+            <div class="section-head"><h2>✨ Positive Prompt</h2><div class="prompt-actions"><button id="copyPromptBtn" class="pill">Copy</button><button id="clearPromptBtn" class="pill">Clear</button></div></div>
+            <textarea id="positivePrompt" class="textarea prompt" placeholder="Positive prompt из workflow появится здесь…"></textarea>
+            <div id="promptSyncState" class="sync-state">Workflow → Prompt</div>
+          </section>
+
+          <section class="card glass prompt-card">
+            <div class="section-head"><h2>⊖ Negative Prompt</h2></div>
+            <textarea id="negativePrompt" class="textarea prompt negative" placeholder="Negative prompt"></textarea>
+          </section>
+
+          <section class="card glass">
+            <button id="advancedToggle" class="section-button"><span>☷ Advanced</span><span id="advancedSummary">—</span><span>⌄</span></button>
+            <div id="advancedPanel" class="advanced-grid hidden">
+              <label>Steps<input id="steps" class="input" type="number" min="1" max="1000"></label>
+              <label>CFG<input id="cfg" class="input" type="number" step="0.1"></label>
+              <label class="span-2">Seed<div class="inline"><input id="seed" class="input" type="number"><button id="seedInlineBtn" class="button secondary">🎲</button></div></label>
+              <label>Width<input id="width" class="input" type="number" step="8"></label>
+              <label>Height<input id="height" class="input" type="number" step="8"></label>
+              <label>Sampler<select id="sampler" class="select"></select></label>
+              <label>Scheduler<select id="scheduler" class="select"></select></label>
+              <label class="span-2">Checkpoint<select id="checkpoint" class="select"></select></label>
+              <label class="span-2">LoRA<select id="lora" class="select"></select></label>
+              <label class="span-2">VAE<select id="vae" class="select"></select></label>
+            </div>
+          </section>
+        </div>
+
+        <aside class="side-column">
+          <section id="generationCard" class="card glass generation-card">
+            <div class="section-head"><div><div class="eyebrow">GENERATION</div><h2 id="generationStage">Ready</h2></div><span id="elapsed" class="badge">0:00</span></div>
+            <div class="progress-track"><div id="progressBar" class="progress-bar"></div></div>
+            <div class="progress-meta"><span id="progressText">0%</span><span id="currentNode">—</span></div>
+            <div class="queue-row"><span>Queue</span><b id="queueCount">0</b></div>
+          </section>
+
+          <section class="card glass">
+            <div class="section-head"><div><div class="eyebrow">RESULTS</div><h2>Gallery</h2></div><button id="resultsRefreshBtn" class="pill">Refresh</button></div>
+            <div id="resultsGrid" class="results-grid"><div class="empty">Результатов пока нет</div></div>
+          </section>
+        </aside>
+      </div>
+    </main>
+
+    <div class="action-bar glass">
+      <button id="stopBtn" class="action stop">■ <span>Stop</span></button>
+      <button id="randomBtn" class="action secondary">🎲 <span>Random Seed</span></button>
+      <button id="generateBtn" class="action generate">✦ <span>Generate</span></button>
+    </div>
+  </div>
+
+  <input id="workflowFile" type="file" accept="application/json,.json" hidden>
+  <input id="mediaFile" type="file" hidden>
+
+  <div id="nodeModal" class="modal hidden">
+    <div class="modal-backdrop" data-close-modal></div>
+    <div class="modal-sheet glass">
+      <div class="modal-head"><div><div class="eyebrow">WORKFLOW</div><h2>Node Editor</h2></div><button class="icon-button" data-close-modal>×</button></div>
+      <input id="nodeSearch" class="input" placeholder="Поиск ноды…">
+      <div id="nodeList" class="node-list"></div>
+    </div>
+  </div>
+
+  <div id="mediaModal" class="modal hidden">
+    <div class="modal-backdrop" data-close-media></div>
+    <div class="media-viewer glass">
+      <button class="media-close" data-close-media>×</button>
+      <div id="mediaViewerBody"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="/web/app.js" defer></script>
+</body>
+</html>
