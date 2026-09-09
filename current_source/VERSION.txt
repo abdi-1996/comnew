@@ -1,2 +1,3 @@
 2.2.2 build 19
-PCRemoteServer 6.3.2
+PCRemoteServer 6.4.0
+ComfyRemote Web 1.0.0

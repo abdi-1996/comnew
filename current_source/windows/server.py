@@ -22,7 +22,7 @@ import uuid
 from ctypes import wintypes
 from pathlib import Path
 
-from flask import Flask, jsonify, request, abort, send_file, Response
+from flask import Flask, jsonify, request, abort, send_file, send_from_directory, redirect, Response
 try:
     from waitress import serve as waitress_serve
 except Exception:
@@ -45,7 +45,9 @@ pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0.01
 
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
-PCREMOTE_VERSION = "6.3.2"
+RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
+WEB_DIR = RESOURCE_DIR / "web"
+PCREMOTE_VERSION = "6.4.0"
 CONFIG_PATH = APP_DIR / "config.json"
 ICON_CACHE_DIR = APP_DIR / "icon_cache"
 ICON_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -4755,6 +4757,110 @@ def corel_export_download(export_id):
     return send_file(path, as_attachment=True, download_name=path.name, conditional=False, max_age=0)
 
 
+
+# ---------------------------------------------------------------------------
+# Comfy Remote Web / PWA 1.0.0
+# ---------------------------------------------------------------------------
+
+@app.get("/")
+def comfy_web_root():
+    return redirect("/web/", code=302)
+
+
+@app.get("/web")
+def comfy_web_redirect():
+    return redirect("/web/", code=302)
+
+
+@app.get("/web/")
+def comfy_web_index():
+    if not WEB_DIR.is_dir():
+        return Response("Comfy Remote Web assets are missing.", status=503, content_type="text/plain; charset=utf-8")
+    response = send_from_directory(WEB_DIR, "index.html", max_age=0)
+    response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
+@app.get("/web/<path:filename>")
+def comfy_web_asset(filename):
+    if not WEB_DIR.is_dir():
+        abort(404)
+    clean = str(filename or "").replace("\\", "/").lstrip("/")
+    parts = Path(clean).parts
+    if not clean or ".." in parts:
+        abort(404)
+    response = send_from_directory(WEB_DIR, clean, max_age=300)
+    if clean in {"app.js", "styles.css", "sw.js", "manifest.webmanifest"}:
+        response.headers["Cache-Control"] = "no-cache"
+    if clean == "sw.js":
+        response.headers["Service-Worker-Allowed"] = "/web/"
+    return response
+
+
+@app.get("/api/web/info")
+def comfy_web_info():
+    return jsonify({
+        "ok": True,
+        "web_version": "1.0.0",
+        "server_version": PCREMOTE_VERSION,
+        "path": "/web/",
+        "pwa": True,
+    })
+
+
+@app.get("/api/comfy/result")
+def comfy_web_result():
+    """Authenticated streaming proxy for ComfyUI image/video/audio results.
+
+    Browser media tags cannot attach the Bearer header themselves, so the web
+    client fetches this endpoint as a protected blob. Range headers are passed
+    through for large media files.
+    """
+    filename = Path(str(request.args.get("filename") or "")).name
+    subfolder = str(request.args.get("subfolder") or "").replace("\\", "/").strip("/")
+    folder_type = str(request.args.get("type") or "output").lower()
+    if not filename or ".." in Path(subfolder).parts or folder_type not in {"input", "output", "temp"}:
+        abort(400)
+
+    url = _comfy_http_url("/view", {"filename": filename, "subfolder": subfolder, "type": folder_type})
+    headers = {"Accept": "*/*", "Accept-Encoding": "identity", "User-Agent": "ComfyRemote-Web/1.0.0"}
+    range_header = request.headers.get("Range")
+    if range_header:
+        headers["Range"] = range_header
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        upstream = urllib.request.urlopen(req, timeout=30)
+    except urllib.error.HTTPError as exc:
+        return jsonify({"ok": False, "error": f"ComfyUI media HTTP {exc.code}"}), exc.code
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 502
+
+    content_type = upstream.headers.get("Content-Type") or "application/octet-stream"
+    status = int(getattr(upstream, "status", 200) or 200)
+    passthrough = {}
+    for key in ("Content-Length", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified"):
+        value = upstream.headers.get(key)
+        if value:
+            passthrough[key] = value
+    passthrough["Cache-Control"] = "private, max-age=60"
+
+    def generate():
+        try:
+            while True:
+                chunk = upstream.read(256 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            try:
+                upstream.close()
+            except Exception:
+                pass
+
+    return Response(generate(), status=status, content_type=content_type, headers=passthrough)
+
+
+
 def _status_payload():
     ip, mac, broadcast = _network_identity()
     tail_ip, tail_dns, tail_online = _tailscale_identity()
@@ -4774,7 +4880,7 @@ def _status_payload():
         "zerotier_online": zero_online,
         "transport": _request_transport(),
         "server_version": PCREMOTE_VERSION,
-        "api_version": 8,
+        "api_version": 9,
         "features": {
             "module_hub": True,
             "capabilities": True,
@@ -4790,6 +4896,7 @@ def _status_payload():
             "file_transfer": True,
             "coreldraw_bridge": True,
             "aitoolkit_bridge": True,
+            "web_app": True,
         },
     }
 
@@ -4802,7 +4909,7 @@ def ping():
         "port": int(CONFIG["port"]),
         "transport": _request_transport(),
         "server_version": PCREMOTE_VERSION,
-        "api_version": 8,
+        "api_version": 9,
         "password_set": password_is_set(),
     })
 
@@ -4835,7 +4942,7 @@ def capabilities():
     return jsonify({
         "ok": True,
         "server_version": PCREMOTE_VERSION,
-        "api_version": 8,
+        "api_version": 9,
         "stable_api": True,
         "modules": {
             "comfyui": {
@@ -4870,6 +4977,7 @@ def capabilities():
             "file_transfer": True,
             "coreldraw_bridge": True,
             "aitoolkit_bridge": True,
+            "web_app": True,
         },
     })
 
