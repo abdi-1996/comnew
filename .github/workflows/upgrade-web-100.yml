@@ -1,0 +1,61 @@
+name: Apply Comfy Remote Web 1.0.0
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/upgrade-web-100.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Validate web source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f current_source/windows/web/index.html
+          test -f current_source/windows/web/styles.css
+          test -f current_source/windows/web/app.js
+          test -f current_source/windows/web/manifest.webmanifest
+          test -f current_source/windows/web/sw.js
+          node --check current_source/windows/web/app.js
+          node --check current_source/windows/web/sw.js
+          python3 -m json.tool current_source/windows/web/manifest.webmanifest >/dev/null
+          grep -q 'Positive Prompt' current_source/windows/web/index.html
+          grep -q '/api/comfy/prompt/set' current_source/windows/web/app.js
+          grep -q '/api/comfy/generate' current_source/windows/web/app.js
+          grep -q '/api/comfy/input/set' current_source/windows/web/app.js
+      - name: Integrate server routes
+        run: python3 tools/upgrade_web_100.py
+      - name: Validate integrated source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile current_source/windows/server.py current_source/windows/gui.py current_source/windows/corel_bridge.py
+          grep -q 'PCREMOTE_VERSION = "6.4.0"' current_source/windows/server.py
+          grep -q 'def comfy_web_index' current_source/windows/server.py
+          grep -q 'def comfy_web_result' current_source/windows/server.py
+          grep -q 'ComfyRemote Web 1.0.0' current_source/VERSION.txt
+          grep -q 'PCRemoteServer 6.4.0' current_source/VERSION.txt
+      - name: Commit integrated web version
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add current_source
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+          else
+            git commit -m "Integrate Comfy Remote Web 1.0.0"
+            git push
+          fi
