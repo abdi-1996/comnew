@@ -103,7 +103,7 @@ jobs:
           $env:PATH="$fakeDir;$env:PATH"
 
           $sourceExe=Resolve-Path 'dist\PCRemoteServer.exe'
-          $stableDir=Join-Path $env:LOCALAPPDATA 'PCRemoteServer-Web-110-CI'
+          $stableDir=Join-Path $env:LOCALAPPDATA 'PCRemoteServer'
           Remove-Item $stableDir -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path $stableDir | Out-Null
           $stableExe=Join-Path $stableDir 'PCRemoteServer.exe'
@@ -139,7 +139,6 @@ jobs:
             $enabled=Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8765/api/tailscale/serve-enable' -Headers $headers -ContentType 'application/json' -Body '{}' -TimeoutSec 12
             if ($enabled.ok -ne $true -or $enabled.configured -ne $true -or $enabled.https_url -ne 'https://test-pc.tailtest.ts.net/web/') { throw 'Tailscale HTTPS enable failed' }
 
-            # Ensure we do not overwrite an unrelated existing Tailscale Serve config.
             Set-Content (Join-Path $fakeDir 'serve-state.txt') 'conflict' -Encoding ASCII
             $conflict=Invoke-RestMethod -Uri 'http://127.0.0.1:8765/api/tailscale/serve-status?force=1' -Headers $headers -TimeoutSec 8
             if ($conflict.conflict -ne $true) { throw 'Tailscale Serve conflict detection failed' }
