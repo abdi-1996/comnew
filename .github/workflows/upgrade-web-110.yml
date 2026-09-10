@@ -1,0 +1,56 @@
+name: Apply Comfy Remote Web 1.1.0
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/upgrade-web-110.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Apply 1.1.0 patch
+        run: python tools/patch_web_110.py
+      - name: Validate source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile current_source/windows/server.py current_source/windows/gui.py current_source/windows/corel_bridge.py
+          node --check current_source/windows/web/app.js
+          node --check current_source/windows/web/sw.js
+          grep -q 'PCREMOTE_VERSION = "6.5.0"' current_source/windows/server.py
+          grep -q 'def _tailscale_serve_enable' current_source/windows/server.py
+          grep -q '/api/tailscale/serve-enable' current_source/windows/server.py
+          grep -q 'web_version": "1.1.0"' current_source/windows/server.py
+          grep -q 'remoteAccessCard' current_source/windows/web/index.html
+          grep -q 'enableTailscaleHTTPS' current_source/windows/web/app.js
+          grep -q 'comfy-remote-web-v1.1.0' current_source/windows/web/sw.js
+          grep -q 'Настроить Tailscale HTTPS' current_source/windows/gui.py
+      - name: Commit upgraded source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Comfy Remote Builder"
+          git config user.email "actions@github.com"
+          git add current_source/windows/server.py current_source/windows/gui.py current_source/windows/web
+          if git diff --cached --quiet; then
+            echo "Already upgraded"
+            exit 0
+          fi
+          git commit -m "Comfy Remote Web 1.1.0 Tailscale HTTPS"
+          git pull --rebase origin main
+          git push origin HEAD:main
