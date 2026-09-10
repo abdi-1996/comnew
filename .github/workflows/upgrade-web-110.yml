@@ -44,6 +44,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          find current_source/windows -type d -name __pycache__ -prune -exec rm -rf {} + || true
+          find current_source/windows -type f -name '*.pyc' -delete || true
           git config user.name "Comfy Remote Builder"
           git config user.email "actions@github.com"
           git add current_source/windows/server.py current_source/windows/gui.py current_source/windows/web
