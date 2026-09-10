@@ -1,0 +1,200 @@
+name: Build Comfy Remote Web 1.1.0 + Server 6.5.0
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-web-110.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Build PCRemoteServer 6.5.0 Web
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Verify source
+        id: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $dir=Join-Path $env:GITHUB_WORKSPACE 'current_source\windows'
+          $web=Join-Path $dir 'web'
+          python -m py_compile (Join-Path $dir 'server.py') (Join-Path $dir 'gui.py') (Join-Path $dir 'corel_bridge.py')
+          node --check (Join-Path $web 'app.js')
+          node --check (Join-Path $web 'sw.js')
+          if (-not (Select-String -Path (Join-Path $dir 'server.py') -Pattern 'PCREMOTE_VERSION = "6.5.0"' -Quiet)) { throw '6.5.0 marker missing' }
+          if (-not (Select-String -Path (Join-Path $dir 'server.py') -Pattern 'def _tailscale_serve_enable' -Quiet)) { throw 'Tailscale Serve logic missing' }
+          if (-not (Select-String -Path (Join-Path $web 'app.js') -Pattern '/api/tailscale/serve-enable' -Quiet)) { throw 'Web HTTPS action missing' }
+          if (-not (Select-String -Path (Join-Path $web 'sw.js') -Pattern 'comfy-remote-web-v1.1.0' -Quiet)) { throw 'PWA cache version missing' }
+          "dir=$dir" >> $env:GITHUB_OUTPUT
+          "web=$web" >> $env:GITHUB_OUTPUT
+          "gui=$(Join-Path $dir 'gui.py')" >> $env:GITHUB_OUTPUT
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip pyinstaller
+          $req="${{ steps.source.outputs.dir }}\requirements.txt"
+          if (Test-Path $req) { python -m pip install -r $req }
+
+      - name: Build server EXE with Web 1.1.0
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed `
+            --paths "${{ steps.source.outputs.dir }}" `
+            --add-data "${{ steps.source.outputs.web }};web" `
+            --collect-all mss --collect-all pyautogui --collect-all comtypes `
+            --hidden-import comtypes.client --hidden-import corel_bridge `
+            --hidden-import pyperclip --hidden-import psutil --hidden-import websocket --hidden-import winreg `
+            --name PCRemoteServer "${{ steps.source.outputs.gui }}"
+
+      - name: Smoke test Web and Tailscale HTTPS
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          Get-Process PCRemoteServer -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+          # Fake the Tailscale CLI so CI can exercise the real server-side Serve logic.
+          $fakeDir=Join-Path $env:RUNNER_TEMP 'fake-tailscale'
+          New-Item -ItemType Directory -Force -Path $fakeDir | Out-Null
+          $fakePy=Join-Path $fakeDir 'fake_tailscale.py'
+          @'
+          import json, pathlib, sys
+          root = pathlib.Path(__file__).resolve().parent
+          state = root / 'serve-state.txt'
+          args = sys.argv[1:]
+          if args[:2] == ['status', '--json']:
+              print(json.dumps({'BackendState':'Running','Self':{'TailscaleIPs':['100.64.0.42'],'DNSName':'test-pc.tailtest.ts.net.','Online':True}}))
+              raise SystemExit(0)
+          if args[:2] == ['ip', '-4']:
+              print('100.64.0.42')
+              raise SystemExit(0)
+          if len(args) >= 3 and args[:3] == ['serve', 'status', '--json']:
+              mode = state.read_text().strip() if state.exists() else 'empty'
+              if mode == 'configured':
+                  print(json.dumps({'TCP':{'443':{'HTTPS':True}},'Web':{'test-pc.tailtest.ts.net:443':{'Handlers':{'/':{'Proxy':'http://127.0.0.1:8765'}}}}}))
+              elif mode == 'conflict':
+                  print(json.dumps({'TCP':{'443':{'HTTPS':True}},'Web':{'test-pc.tailtest.ts.net:443':{'Handlers':{'/':{'Proxy':'http://127.0.0.1:9999'}}}}}))
+              else:
+                  print('{}')
+              raise SystemExit(0)
+          if args and args[0] == 'serve' and '--bg' in args and '--yes' in args and 'http://127.0.0.1:8765' in args:
+              state.write_text('configured')
+              print('Available within your tailnet: https://test-pc.tailtest.ts.net/')
+              raise SystemExit(0)
+          print('unsupported fake tailscale args: ' + repr(args), file=sys.stderr)
+          raise SystemExit(2)
+          '@ | Set-Content $fakePy -Encoding UTF8
+          @"
+          @echo off
+          python "$fakePy" %*
+          "@ | Set-Content (Join-Path $fakeDir 'tailscale.cmd') -Encoding ASCII
+          $env:PATH="$fakeDir;$env:PATH"
+
+          $sourceExe=Resolve-Path 'dist\PCRemoteServer.exe'
+          $stableDir=Join-Path $env:LOCALAPPDATA 'PCRemoteServer-Web-110-CI'
+          Remove-Item $stableDir -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $stableDir | Out-Null
+          $stableExe=Join-Path $stableDir 'PCRemoteServer.exe'
+          Copy-Item $sourceExe $stableExe -Force
+          $proc=Start-Process -FilePath $stableExe -WorkingDirectory $stableDir -PassThru
+          try {
+            $ready=$false
+            for ($i=0; $i -lt 50; $i++) {
+              Start-Sleep -Milliseconds 700
+              try {
+                $ping=Invoke-RestMethod -Uri 'http://127.0.0.1:8765/api/ping' -TimeoutSec 2
+                if ($ping.ok -eq $true -and $ping.server_version -eq '6.5.0') { $ready=$true; break }
+              } catch {}
+              if ($proc.HasExited) { throw "Server exited: $($proc.ExitCode)" }
+            }
+            if (-not $ready) { throw 'Server 6.5.0 did not start' }
+
+            $html=Invoke-WebRequest -Uri 'http://127.0.0.1:8765/web/' -UseBasicParsing -TimeoutSec 5
+            if ($html.StatusCode -ne 200 -or $html.Content -notmatch 'remoteAccessCard') { throw 'Web 1.1.0 index smoke test failed' }
+            $js=Invoke-WebRequest -Uri 'http://127.0.0.1:8765/web/app.js' -UseBasicParsing -TimeoutSec 5
+            if ($js.StatusCode -ne 200 -or $js.Content -notmatch '/api/tailscale/serve-enable') { throw 'Web 1.1.0 JS smoke test failed' }
+            $manifest=(Invoke-WebRequest -Uri 'http://127.0.0.1:8765/web/manifest.webmanifest' -UseBasicParsing -TimeoutSec 5).Content | ConvertFrom-Json
+            if (-not $manifest.name -or $manifest.start_url -ne '/web/') { throw 'PWA manifest smoke test failed' }
+
+            $config=Get-Content (Join-Path $stableDir 'config.json') -Raw | ConvertFrom-Json
+            $headers=@{ Authorization = "Bearer $($config.token)" }
+            $info=Invoke-RestMethod -Uri 'http://127.0.0.1:8765/api/web/info' -Headers $headers -TimeoutSec 5
+            if ($info.ok -ne $true -or $info.web_version -ne '1.1.0') { throw 'Web info smoke test failed' }
+
+            $serve=Invoke-RestMethod -Uri 'http://127.0.0.1:8765/api/tailscale/serve-status?force=1' -Headers $headers -TimeoutSec 8
+            if ($serve.ok -ne $true -or $serve.online -ne $true -or $serve.configured -eq $true) { throw 'Initial Tailscale Serve status failed' }
+
+            $enabled=Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8765/api/tailscale/serve-enable' -Headers $headers -ContentType 'application/json' -Body '{}' -TimeoutSec 12
+            if ($enabled.ok -ne $true -or $enabled.configured -ne $true -or $enabled.https_url -ne 'https://test-pc.tailtest.ts.net/web/') { throw 'Tailscale HTTPS enable failed' }
+
+            # Ensure we do not overwrite an unrelated existing Tailscale Serve config.
+            Set-Content (Join-Path $fakeDir 'serve-state.txt') 'conflict' -Encoding ASCII
+            $conflict=Invoke-RestMethod -Uri 'http://127.0.0.1:8765/api/tailscale/serve-status?force=1' -Headers $headers -TimeoutSec 8
+            if ($conflict.conflict -ne $true) { throw 'Tailscale Serve conflict detection failed' }
+            $blocked=$false
+            try {
+              Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8765/api/tailscale/serve-enable' -Headers $headers -ContentType 'application/json' -Body '{}' -TimeoutSec 12 | Out-Null
+            } catch {
+              if ($_.Exception.Response.StatusCode.value__ -eq 409) { $blocked=$true } else { throw }
+            }
+            if (-not $blocked) { throw 'Existing Tailscale Serve config was not protected' }
+
+            $dash=Invoke-RestMethod -Uri 'http://127.0.0.1:8765/api/comfy/dashboard' -Headers $headers -TimeoutSec 8
+            if ($dash.ok -ne $true) { throw 'Comfy dashboard route failed' }
+            Write-Host 'Comfy Remote Web 1.1.0 + Tailscale HTTPS smoke test OK'
+          } finally {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            Get-Process PCRemoteServer -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Package Windows server
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path 'ComfyRemote-Web-Server' | Out-Null
+          Copy-Item 'dist\PCRemoteServer.exe' 'ComfyRemote-Web-Server\PCRemoteServer.exe'
+          foreach ($name in @('SETUP_NETWORK_ADMIN.ps1','SETUP_NETWORK_ADMIN.bat','CHECK_NETWORK.ps1','INSTALL_STABLE_SERVER.ps1','INSTALL_STABLE_SERVER.bat','OPEN_COMFY_REMOTE_WEB.bat')) {
+            $src=Join-Path "${{ steps.source.outputs.dir }}" $name
+            if (Test-Path $src) { Copy-Item $src (Join-Path 'ComfyRemote-Web-Server' $name) }
+          }
+          Copy-Item "${{ steps.source.outputs.web }}" 'ComfyRemote-Web-Server\web-source' -Recurse
+          @"
+          Comfy Remote Web 1.1.0
+          PCRemoteServer 6.5.0
+
+          Локально: http://127.0.0.1:8765/web/
+          В LAN: http://IP_ПК:8765/web/
+
+          Tailscale HTTPS:
+          1. Запустите PCRemoteServer.exe и Tailscale.
+          2. В окне PC Remote нажмите «Настроить Tailscale HTTPS» либо войдите в Web и нажмите такую же кнопку в карточке Remote Access.
+          3. После настройки сервер покажет адрес https://имя-пк.tailXXXX.ts.net/web/
+          4. На iPhone/iPad Tailscale должен быть подключён к тому же tailnet.
+
+          Comfy Remote никогда автоматически не перезаписывает уже существующую стороннюю Tailscale Serve-конфигурацию.
+          "@ | Set-Content 'ComfyRemote-Web-Server\README-WEB.txt' -Encoding UTF8
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: PCRemoteServer-6.5.0-ComfyRemote-Web-1.1.0
+          path: ComfyRemote-Web-Server
+          if-no-files-found: error
+
+      - name: Upload standalone web source
+        uses: actions/upload-artifact@v4
+        with:
+          name: ComfyRemote-Web-1.1.0-Source
+          path: current_source/windows/web
+          if-no-files-found: error
