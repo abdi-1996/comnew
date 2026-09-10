@@ -48,7 +48,7 @@ jobs:
           find current_source/windows -type f -name '*.pyc' -delete || true
           git config user.name "Comfy Remote Builder"
           git config user.email "actions@github.com"
-          git add current_source/windows/server.py current_source/windows/gui.py current_source/windows/web
+          git add -A current_source/windows
           if git diff --cached --quiet; then
             echo "Already upgraded"
             exit 0
