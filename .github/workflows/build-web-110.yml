@@ -125,8 +125,8 @@ jobs:
             if ($html.StatusCode -ne 200 -or $html.Content -notmatch 'remoteAccessCard') { throw 'Web 1.1.0 index smoke test failed' }
             $js=Invoke-WebRequest -Uri 'http://127.0.0.1:8765/web/app.js' -UseBasicParsing -TimeoutSec 5
             if ($js.StatusCode -ne 200 -or $js.Content -notmatch '/api/tailscale/serve-enable') { throw 'Web 1.1.0 JS smoke test failed' }
-            $manifest=(Invoke-WebRequest -Uri 'http://127.0.0.1:8765/web/manifest.webmanifest' -UseBasicParsing -TimeoutSec 5).Content | ConvertFrom-Json
-            if (-not $manifest.name -or $manifest.start_url -ne '/web/') { throw 'PWA manifest smoke test failed' }
+            $manifest=Invoke-RestMethod -Uri 'http://127.0.0.1:8765/web/manifest.webmanifest' -TimeoutSec 5
+            if ($manifest.name -ne 'Comfy Remote Web' -or $manifest.start_url -ne '/web/') { throw 'PWA manifest smoke test failed' }
 
             $config=Get-Content (Join-Path $stableDir 'config.json') -Raw | ConvertFrom-Json
             $headers=@{ Authorization = "Bearer $($config.token)" }
