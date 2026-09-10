@@ -5,6 +5,7 @@
   const state = {
     token: localStorage.getItem('comfyremote.web.token') || '',
     dashboard: null,
+    serve: null,
     details: null,
     workflowID: localStorage.getItem('comfyremote.web.workflow') || '',
     outputNodeID: '',
@@ -20,6 +21,8 @@
     loginScreen: $('loginScreen'), app: $('app'), pingInfo: $('pingInfo'), password: $('password'), loginBtn: $('loginBtn'),
     connectionId: $('connectionId'), connectionIdBtn: $('connectionIdBtn'), loginError: $('loginError'),
     connectionDot: $('connectionDot'), connectionText: $('connectionText'), systemStats: $('systemStats'),
+    tailscaleServeState: $('tailscaleServeState'), tailscaleServeDetail: $('tailscaleServeDetail'), tailscaleServeUrl: $('tailscaleServeUrl'),
+    tailscaleServeSetupBtn: $('tailscaleServeSetupBtn'), tailscaleServeOpenBtn: $('tailscaleServeOpenBtn'), tailscaleServeCopyBtn: $('tailscaleServeCopyBtn'),
     workflowSelect: $('workflowSelect'), workflowMeta: $('workflowMeta'), workflowReloadBtn: $('workflowReloadBtn'),
     dynamicInputs: $('dynamicInputs'), outputCard: $('outputCard'), outputCount: $('outputCount'), outputSelect: $('outputSelect'), outputOnly: $('outputOnly'),
     positive: $('positivePrompt'), negative: $('negativePrompt'), promptSyncState: $('promptSyncState'),
@@ -75,6 +78,7 @@
   function showApp() {
     els.loginScreen.classList.add('hidden');
     els.app.classList.remove('hidden');
+    refreshRemoteAccess(true);
   }
 
   function toast(message) {
@@ -172,6 +176,111 @@
     els.advancedSummary.textContent = `${p.steps ?? 20} steps · CFG ${p.cfg ?? 7}`;
     els.promptSyncState.textContent = els.positive.value ? 'Prompt загружен из workflow' : 'Prompt в workflow не найден';
     els.promptSyncState.className = `sync-state ${els.positive.value ? 'ok' : ''}`;
+  }
+
+
+  function renderRemoteAccess(value) {
+    state.serve = value || null;
+    if (!els.tailscaleServeState) return;
+    const installed = !!value?.installed;
+    const online = !!value?.online;
+    const configured = !!value?.configured;
+    const conflict = !!value?.conflict;
+    const secureHere = location.protocol === 'https:' && value?.dns && location.hostname.toLowerCase() === String(value.dns).toLowerCase();
+
+    els.tailscaleServeState.className = 'badge';
+    els.tailscaleServeSetupBtn.classList.remove('hidden');
+    els.tailscaleServeOpenBtn.classList.add('hidden');
+    els.tailscaleServeCopyBtn.classList.add('hidden');
+    els.tailscaleServeUrl.classList.add('hidden');
+
+    if (!installed) {
+      els.tailscaleServeState.textContent = 'Не установлен';
+      els.tailscaleServeState.classList.add('warning');
+      els.tailscaleServeDetail.textContent = 'Установите Tailscale на ПК и войдите в tailnet.';
+      els.tailscaleServeSetupBtn.disabled = true;
+      return;
+    }
+    if (!online) {
+      els.tailscaleServeState.textContent = 'Offline';
+      els.tailscaleServeState.classList.add('warning');
+      els.tailscaleServeDetail.textContent = 'Tailscale установлен, но сейчас не подключён.';
+      els.tailscaleServeSetupBtn.disabled = true;
+      return;
+    }
+    if (conflict) {
+      els.tailscaleServeState.textContent = 'Занято';
+      els.tailscaleServeState.classList.add('warning');
+      els.tailscaleServeDetail.textContent = value?.detail || 'Tailscale Serve уже используется другой конфигурацией.';
+      els.tailscaleServeSetupBtn.disabled = true;
+      return;
+    }
+
+    els.tailscaleServeSetupBtn.disabled = false;
+    if (configured && value?.https_url) {
+      els.tailscaleServeState.textContent = secureHere ? 'HTTPS активен' : 'Готово';
+      els.tailscaleServeState.classList.add('secure');
+      els.tailscaleServeDetail.textContent = secureHere
+        ? 'Вы уже используете защищённое Tailscale HTTPS-подключение.'
+        : 'Защищённый адрес доступен внутри вашего tailnet и подходит для PWA.';
+      els.tailscaleServeUrl.textContent = value.https_url;
+      els.tailscaleServeUrl.classList.remove('hidden');
+      els.tailscaleServeSetupBtn.classList.add('hidden');
+      if (!secureHere) els.tailscaleServeOpenBtn.classList.remove('hidden');
+      els.tailscaleServeCopyBtn.classList.remove('hidden');
+      return;
+    }
+
+    els.tailscaleServeState.textContent = 'Не настроен';
+    els.tailscaleServeDetail.textContent = value?.dns
+      ? `Готово к настройке для ${value.dns}.`
+      : 'Tailscale подключён. Настройте HTTPS одним нажатием.';
+  }
+
+  async function refreshRemoteAccess(force = false) {
+    if (!state.token || !els.tailscaleServeState) return;
+    try {
+      const value = await api(`/api/tailscale/serve-status${force ? '?force=1' : ''}`);
+      renderRemoteAccess(value);
+    } catch (error) {
+      els.tailscaleServeState.textContent = 'Ошибка';
+      els.tailscaleServeState.className = 'badge warning';
+      els.tailscaleServeDetail.textContent = error.message;
+    }
+  }
+
+  async function enableTailscaleHTTPS() {
+    if (!els.tailscaleServeSetupBtn) return;
+    els.tailscaleServeSetupBtn.disabled = true;
+    els.tailscaleServeSetupBtn.textContent = 'Настройка…';
+    try {
+      const value = await api('/api/tailscale/serve-enable', { method: 'POST' });
+      renderRemoteAccess(value);
+      toast('Tailscale HTTPS настроен');
+    } catch (error) {
+      toast(error.message);
+      els.tailscaleServeDetail.textContent = error.message;
+      await refreshRemoteAccess(true);
+    } finally {
+      els.tailscaleServeSetupBtn.textContent = 'Настроить HTTPS';
+      if (!state.serve?.configured && !state.serve?.conflict) els.tailscaleServeSetupBtn.disabled = false;
+    }
+  }
+
+  function openTailscaleHTTPS() {
+    const url = state.serve?.https_url;
+    if (url) window.location.assign(url);
+  }
+
+  async function copyTailscaleHTTPS() {
+    const url = state.serve?.https_url;
+    if (!url) return;
+    try {
+      await navigator.clipboard.writeText(url);
+      toast('HTTPS-ссылка скопирована');
+    } catch {
+      toast('Скопируйте ссылку из карточки');
+    }
   }
 
   function formatMetric(value, suffix = '') { return value === null || value === undefined || Number.isNaN(Number(value)) ? '—' : `${Number(value).toFixed(value < 10 && suffix === ' GB' ? 1 : 0)}${suffix}`; }
@@ -406,6 +515,7 @@
 
   function bindEvents(){
     els.loginBtn.addEventListener('click',loginWithPassword);els.password.addEventListener('keydown',e=>{if(e.key==='Enter')loginWithPassword();});els.connectionIdBtn.addEventListener('click',loginWithConnectionID);
+    els.tailscaleServeSetupBtn?.addEventListener('click',enableTailscaleHTTPS);els.tailscaleServeOpenBtn?.addEventListener('click',openTailscaleHTTPS);els.tailscaleServeCopyBtn?.addEventListener('click',copyTailscaleHTTPS);
     $('refreshBtn').addEventListener('click',()=>refreshDashboard({loadParameters:true,forceDetails:true}));els.workflowReloadBtn.addEventListener('click',()=>refreshDashboard({loadParameters:true,forceDetails:true}));$('resultsRefreshBtn').addEventListener('click',()=>{state.lastResultSignature='';refreshDashboard({loadParameters:false});});
     els.workflowSelect.addEventListener('change',async()=>{state.workflowID=els.workflowSelect.value;localStorage.setItem('comfyremote.web.workflow',state.workflowID);els.positive.dataset.loaded='';await refreshDashboard({loadParameters:true,forceDetails:true});});
     els.positive.addEventListener('input',schedulePromptSync);els.negative.addEventListener('input',schedulePromptSync);
@@ -415,7 +525,7 @@
     $('importWorkflowBtn').addEventListener('click',()=>{els.workflowFile.value='';els.workflowFile.click();});els.workflowFile.addEventListener('change',()=>importWorkflow(els.workflowFile.files?.[0]));els.mediaFile.addEventListener('change',()=>uploadMedia(els.mediaFile.files?.[0]));
     $('nodesBtn').addEventListener('click',()=>{renderNodeList();els.nodeModal.classList.remove('hidden');});els.nodeSearch.addEventListener('input',renderNodeList);document.querySelectorAll('[data-close-modal]').forEach(x=>x.addEventListener('click',()=>els.nodeModal.classList.add('hidden')));document.querySelectorAll('[data-close-media]').forEach(x=>x.addEventListener('click',closeMedia));
     $('logoutBtn').addEventListener('click',()=>showLogin('Вы вышли из Web Remote.'));
-    document.addEventListener('visibilitychange',()=>{if(!document.hidden&&state.token)refreshDashboard({loadParameters:false});});
+    document.addEventListener('visibilitychange',()=>{if(!document.hidden&&state.token){refreshDashboard({loadParameters:false});refreshRemoteAccess();}});
   }
 
   async function boot(){bindEvents();await probe();if(state.token){try{await api('/api/status');showApp();await refreshDashboard({loadParameters:true,forceDetails:true});schedulePoll();return;}catch{showLogin('Войдите в PC Remote Server.');}}showLogin();}

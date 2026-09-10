@@ -47,7 +47,7 @@ pyautogui.PAUSE = 0.01
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
 WEB_DIR = RESOURCE_DIR / "web"
-PCREMOTE_VERSION = "6.4.0"
+PCREMOTE_VERSION = "6.5.0"
 CONFIG_PATH = APP_DIR / "config.json"
 ICON_CACHE_DIR = APP_DIR / "icon_cache"
 ICON_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -102,6 +102,8 @@ COMFY_STATE = {
 COMFY_WS_THREAD = None
 TAILSCALE_CACHE = {"time": 0.0, "value": (None, None, False)}
 TAILSCALE_CACHE_LOCK = threading.Lock()
+TAILSCALE_SERVE_CACHE = {"time": 0.0, "value": None}
+TAILSCALE_SERVE_LOCK = threading.Lock()
 ZEROTIER_CACHE = {"time": 0.0, "value": (None, False)}
 ZEROTIER_CACHE_LOCK = threading.Lock()
 
@@ -368,6 +370,147 @@ def _tailscale_cli_set(enabled):
         details = (result.stderr or result.stdout or "").strip()
         raise ValueError(details or f"Команда Tailscale завершилась с кодом {result.returncode}.")
     return _tailscale_runtime_status(force=True)
+
+
+
+def _tailscale_serve_cache(value):
+    with TAILSCALE_SERVE_LOCK:
+        TAILSCALE_SERVE_CACHE["time"] = time.time()
+        TAILSCALE_SERVE_CACHE["value"] = dict(value)
+    return value
+
+
+def _tailscale_serve_status(force=False):
+    # Return safe status for Tailscale Serve HTTPS -> local PCRemoteServer.
+    now = time.time()
+    with TAILSCALE_SERVE_LOCK:
+        cached = TAILSCALE_SERVE_CACHE.get("value")
+        if not force and cached is not None and now - float(TAILSCALE_SERVE_CACHE.get("time", 0.0)) < 5.0:
+            return dict(cached)
+
+    runtime = _tailscale_runtime_status(force=force)
+    port = int(CONFIG.get("port", 8765))
+    backend = f"http://127.0.0.1:{port}"
+    base = {
+        "installed": bool(runtime.get("installed")),
+        "enabled": bool(runtime.get("enabled")),
+        "online": bool(runtime.get("online")),
+        "dns": runtime.get("dns"),
+        "ip": runtime.get("ip"),
+        "backend": backend,
+        "configured": False,
+        "conflict": False,
+        "supported": True,
+        "https_url": None,
+        "root_url": f"https://{runtime.get('dns')}/" if runtime.get("dns") else None,
+        "detail": None,
+    }
+    exe = _tailscale_executable()
+    if not exe:
+        base["supported"] = False
+        base["detail"] = "Tailscale не установлен на ПК."
+        return _tailscale_serve_cache(base)
+
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+    try:
+        result = subprocess.run(
+            [exe, "serve", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            creationflags=flags,
+            check=False,
+        )
+    except Exception as exc:
+        base["supported"] = False
+        base["detail"] = str(exc)
+        return _tailscale_serve_cache(base)
+
+    raw = (result.stdout or "").strip()
+    err = (result.stderr or "").strip()
+    if result.returncode != 0:
+        combined = (err or raw or f"tailscale serve status: code {result.returncode}").strip()
+        low = combined.lower()
+        if "unknown command" in low or "not a command" in low or "flag provided but not defined" in low:
+            base["supported"] = False
+        base["detail"] = combined
+        return _tailscale_serve_cache(base)
+
+    try:
+        config = json.loads(raw) if raw else {}
+    except Exception:
+        config = {}
+
+    strings = []
+    def collect(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                strings.append(str(key))
+                collect(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+        elif isinstance(value, str):
+            strings.append(value)
+    collect(config)
+    lower_strings = [item.lower().rstrip("/") for item in strings]
+    backend_tokens = {
+        backend.lower().rstrip("/"),
+        f"127.0.0.1:{port}",
+        f"localhost:{port}",
+        f"http://localhost:{port}",
+    }
+    configured = any(any(token in item for token in backend_tokens) for item in lower_strings)
+    base["configured"] = configured
+    base["conflict"] = bool(config and not configured)
+    if configured and base.get("dns"):
+        base["https_url"] = f"https://{base['dns']}/web/"
+    if base["conflict"]:
+        base["detail"] = "На Tailscale Serve уже есть другая конфигурация. Comfy Remote не будет перезаписывать её автоматически."
+    return _tailscale_serve_cache(base)
+
+
+def _tailscale_serve_enable():
+    runtime = _tailscale_runtime_status(force=True)
+    if not runtime.get("installed"):
+        raise ValueError("Tailscale не установлен на ПК.")
+    if not runtime.get("enabled") or not runtime.get("online"):
+        raise ValueError("Сначала включите Tailscale и дождитесь статуса Online.")
+    if not runtime.get("dns"):
+        raise ValueError("Tailscale MagicDNS/HTTPS имя ещё не доступно.")
+
+    current = _tailscale_serve_status(force=True)
+    if current.get("configured"):
+        return current
+    if current.get("conflict"):
+        raise ValueError(current.get("detail") or "Tailscale Serve уже используется.")
+    if not current.get("supported", True):
+        raise ValueError(current.get("detail") or "Эта версия Tailscale не поддерживает Serve.")
+
+    exe = _tailscale_executable()
+    port = int(CONFIG.get("port", 8765))
+    backend = f"http://127.0.0.1:{port}"
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+    result = subprocess.run(
+        [exe, "serve", "--bg", "--yes", backend],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        creationflags=flags,
+        check=False,
+    )
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout or "").strip()
+        raise ValueError(details or f"tailscale serve завершился с кодом {result.returncode}.")
+
+    with TAILSCALE_SERVE_LOCK:
+        TAILSCALE_SERVE_CACHE["time"] = 0.0
+        TAILSCALE_SERVE_CACHE["value"] = None
+    status = _tailscale_serve_status(force=True)
+    if not status.get("configured"):
+        details = (result.stdout or result.stderr or "").strip()
+        raise ValueError(details or "Tailscale Serve запустился, но прокси PC Remote не найден.")
+    return status
 
 
 def _tailscale_down_delayed():
@@ -4797,11 +4940,29 @@ def comfy_web_asset(filename):
     return response
 
 
+
+@app.get("/api/tailscale/serve-status")
+def tailscale_serve_status():
+    value = _tailscale_serve_status(force=request.args.get("force") in {"1", "true", "yes"})
+    return jsonify({"ok": True, **value})
+
+
+@app.post("/api/tailscale/serve-enable")
+def tailscale_serve_enable():
+    try:
+        value = _tailscale_serve_enable()
+        return jsonify({"ok": True, **value})
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 409
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
 @app.get("/api/web/info")
 def comfy_web_info():
     return jsonify({
         "ok": True,
-        "web_version": "1.0.0",
+        "web_version": "1.1.0",
         "server_version": PCREMOTE_VERSION,
         "path": "/web/",
         "pwa": True,
@@ -4892,6 +5053,7 @@ def _status_payload():
             "audio_workflows": True,
             "audio_results": True,
             "tailscale_control": True,
+            "tailscale_https_serve": True,
             "interrupt": True,
             "file_transfer": True,
             "coreldraw_bridge": True,
@@ -4973,6 +5135,7 @@ def capabilities():
             "comfy_input_upload": True,
             "result_metadata": True,
             "tailscale_control": True,
+            "tailscale_https_serve": True,
             "interrupt": True,
             "file_transfer": True,
             "coreldraw_bridge": True,

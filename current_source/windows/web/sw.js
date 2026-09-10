@@ -1,4 +1,4 @@
-const CACHE='comfy-remote-web-v1.0.0';
+const CACHE='comfy-remote-web-v1.1.0';
 const STATIC=['/web/','/web/index.html','/web/styles.css','/web/app.js','/web/manifest.webmanifest','/web/icon.svg'];
 self.addEventListener('install',event=>{event.waitUntil(caches.open(CACHE).then(cache=>cache.addAll(STATIC)).then(()=>self.skipWaiting()));});
 self.addEventListener('activate',event=>{event.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(k=>k!==CACHE).map(k=>caches.delete(k)))).then(()=>self.clients.claim()));});

@@ -164,6 +164,10 @@ def refresh_labels():
         text="Пароль задан ✓" if server.password_is_set() else "Пароль ещё не задан",
         fg="#16803c" if server.password_is_set() else "#b15a00",
     )
+    try:
+        refresh_https_access()
+    except Exception:
+        pass
 
 
 def save_password():
@@ -224,6 +228,60 @@ def toggle_autostart():
         autostart_var.set(f"Ошибка автозапуска: {exc}")
         return
     refresh_autostart()
+
+
+
+def refresh_https_access():
+    try:
+        value = server._tailscale_serve_status(force=True)
+        if not value.get("installed"):
+            https_var.set("Tailscale HTTPS: Tailscale не установлен")
+            https_setup_btn.config(state="disabled")
+            https_open_btn.config(state="disabled")
+        elif not value.get("online"):
+            https_var.set("Tailscale HTTPS: Tailscale Offline")
+            https_setup_btn.config(state="disabled")
+            https_open_btn.config(state="disabled")
+        elif value.get("conflict"):
+            https_var.set("Tailscale HTTPS: Serve уже занят другой конфигурацией")
+            https_setup_btn.config(state="disabled")
+            https_open_btn.config(state="disabled")
+        elif value.get("configured") and value.get("https_url"):
+            https_var.set("Tailscale HTTPS: " + value["https_url"])
+            https_setup_btn.config(state="disabled")
+            https_open_btn.config(state="normal")
+        else:
+            https_var.set("Tailscale HTTPS: не настроен")
+            https_setup_btn.config(state="normal")
+            https_open_btn.config(state="disabled")
+    except Exception as exc:
+        https_var.set(f"Tailscale HTTPS: {exc}")
+
+
+def configure_https_access():
+    https_setup_btn.config(state="disabled")
+    https_var.set("Tailscale HTTPS: настройка…")
+    def work():
+        try:
+            value = server._tailscale_serve_enable()
+            message = "Tailscale HTTPS: " + str(value.get("https_url") or "готово")
+        except Exception as exc:
+            message = f"Tailscale HTTPS: ошибка — {exc}"
+        root.after(0, lambda: (https_var.set(message), refresh_https_access()))
+    threading.Thread(target=work, daemon=True).start()
+
+
+def open_https_access():
+    try:
+        value = server._tailscale_serve_status(force=True)
+        url = value.get("https_url")
+        if not url:
+            refresh_https_access()
+            return
+        os.startfile(url)
+    except Exception:
+        refresh_https_access()
+
 
 
 def configure_network():
@@ -299,12 +357,12 @@ def start():
 
 root = tk.Tk()
 root.title(f"PC Remote Server {server.PCREMOTE_VERSION}")
-root.geometry("660x690")
+root.geometry("660x780")
 root.resizable(False, False)
 root.configure(bg="#eef5ff")
 
 card = tk.Frame(root, bg="white", highlightthickness=1, highlightbackground="#d5e5ff")
-card.place(x=22, y=18, width=616, height=654)
+card.place(x=22, y=18, width=616, height=744)
 
 tk.Label(card, text="PC Remote Server", bg="white", fg="#173569", font=("Segoe UI", 22, "bold")).pack(pady=(18, 3))
 tk.Label(card, text="Задайте свой пароль — на iPhone для входа нужен только он.", bg="white", fg="#617493", font=("Segoe UI", 10)).pack()
@@ -349,6 +407,18 @@ start_btn = tk.Button(buttons, text="Запустить сервер", width=20,
 start_btn.grid(row=0, column=0, padx=7)
 tk.Button(buttons, text="Обновить адреса", width=20, command=refresh_labels).grid(row=0, column=1, padx=7)
 
+
+https_frame = tk.Frame(card, bg="white")
+https_frame.pack(fill="x", padx=30, pady=(4, 4))
+https_var = tk.StringVar(value="Tailscale HTTPS: проверка…")
+tk.Label(https_frame, textvariable=https_var, bg="white", fg="#2450a6", font=("Segoe UI", 9, "bold"), wraplength=540, justify="left").pack(anchor="w")
+https_buttons = tk.Frame(https_frame, bg="white")
+https_buttons.pack(anchor="w", pady=(6, 0))
+https_setup_btn = tk.Button(https_buttons, text="Настроить Tailscale HTTPS", width=25, command=configure_https_access)
+https_setup_btn.grid(row=0, column=0, padx=(0, 8))
+https_open_btn = tk.Button(https_buttons, text="Открыть HTTPS", width=18, command=open_https_access, state="disabled")
+https_open_btn.grid(row=0, column=1)
+
 network_frame = tk.Frame(card, bg="white")
 network_frame.pack(pady=(2, 6))
 tk.Button(network_frame, text="Настроить LAN / Tailscale / ZeroTier", width=36, command=configure_network).pack()
@@ -367,7 +437,7 @@ autostart_btn.grid(row=0, column=1, padx=8)
 
 tk.Label(
     card,
-    text="После смены пароля старые подключения автоматически перестают работать. Для доступа вне дома используйте ZeroTier или Tailscale; сервер должен оставаться запущенным.",
+    text="После смены пароля старые подключения автоматически перестают работать. Для доступа вне дома используйте Tailscale HTTPS: нажмите «Настроить Tailscale HTTPS». Сервер должен оставаться запущенным.",
     bg="white",
     fg="#6a7d9b",
     font=("Segoe UI", 9),

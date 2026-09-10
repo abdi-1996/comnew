@@ -20,7 +20,7 @@
     <div class="login-card glass">
       <div class="brand-mark">●●●</div>
       <h1>Comfy Remote</h1>
-      <p class="muted">Web 1.0.0 · управление ComfyUI через PCRemoteServer</p>
+      <p class="muted">Web 1.1.0 · ComfyUI + защищённый Tailscale HTTPS</p>
       <div id="pingInfo" class="connection-chip">Проверяем сервер…</div>
       <label class="field-label" for="password">Пароль подключения</label>
       <input id="password" class="input" type="password" autocomplete="current-password" placeholder="Пароль PC Remote Server">
@@ -100,6 +100,21 @@
         </div>
 
         <aside class="side-column">
+
+          <section id="remoteAccessCard" class="card glass remote-card">
+            <div class="section-head">
+              <div><div class="eyebrow">REMOTE ACCESS</div><h2>Tailscale HTTPS</h2></div>
+              <span id="tailscaleServeState" class="badge">Проверка…</span>
+            </div>
+            <p id="tailscaleServeDetail" class="muted small">Проверяем защищённый доступ вне дома.</p>
+            <div id="tailscaleServeUrl" class="remote-url hidden"></div>
+            <div class="remote-actions">
+              <button id="tailscaleServeSetupBtn" class="button primary">Настроить HTTPS</button>
+              <button id="tailscaleServeOpenBtn" class="button secondary hidden">Открыть через Tailscale HTTPS</button>
+              <button id="tailscaleServeCopyBtn" class="pill hidden">Copy link</button>
+            </div>
+          </section>
+
           <section id="generationCard" class="card glass generation-card">
             <div class="section-head"><div><div class="eyebrow">GENERATION</div><h2 id="generationStage">Ready</h2></div><span id="elapsed" class="badge">0:00</span></div>
             <div class="progress-track"><div id="progressBar" class="progress-bar"></div></div>
